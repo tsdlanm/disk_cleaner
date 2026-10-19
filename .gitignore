@@ -1,0 +1,6 @@
+/cli_app
+/bin/
+*.exe
+*.test
+*.out
+.env
