@@ -29,6 +29,17 @@ type Info struct {
 	Locked int64 // jumlah folder turunan yang tidak bisa dibaca
 }
 
+// Slots membatasi jumlah goroutine pembaca folder tambahan untuk SEMUA
+// pemindai di program ini (explorer, file baru, analisis AI) sekaligus.
+// Tujuannya selesai secepat mungkin: dari pengukuran, 4x jumlah core adalah
+// titik tercepat (menambah lagi tidak lebih cepat karena disk dan kernel
+// Windows sudah jenuh). Kuota ini dibagi bersama, jadi tidak berlipat saat
+// beberapa pemindai berjalan bersamaan.
+var Slots = make(chan struct{}, runtime.NumCPU()*4)
+
+// workers adalah jumlah folder yang dihitung bersamaan oleh explorer.
+var workers = max(2, runtime.NumCPU())
+
 // Sizer menjalankan worker yang menghitung ukuran folder dari antrean LIFO:
 // permintaan terbaru (folder yang sedang dibuka) selalu didahulukan.
 type Sizer struct {
@@ -41,8 +52,6 @@ type Sizer struct {
 	cond   *sync.Cond
 	stack  []string
 	queued map[string]bool // ada di stack atau sedang dikerjakan
-
-	sem chan struct{} // batas goroutine walker
 }
 
 // New membuat Sizer dan menjalankan worker-nya.
@@ -51,10 +60,9 @@ func New() *Sizer {
 		cache:  make(map[string]Info),
 		live:   make(map[string]*atomic.Int64),
 		queued: make(map[string]bool),
-		sem:    make(chan struct{}, runtime.NumCPU()*4),
 	}
 	s.cond = sync.NewCond(&s.qmu)
-	for range max(runtime.NumCPU(), 2) {
+	for range workers {
 		go s.worker()
 	}
 	return s
@@ -100,6 +108,14 @@ func (s *Sizer) Request(paths ...string) {
 	if added {
 		s.cond.Broadcast()
 	}
+}
+
+// Put menyimpan ukuran folder yang sudah dihitung oleh pemindai lain,
+// sehingga folder itu tidak perlu dipindai ulang saat dibuka.
+func (s *Sizer) Put(path string, inf Info) {
+	s.mu.Lock()
+	s.cache[path] = inf
+	s.mu.Unlock()
 }
 
 // Pending mengembalikan jumlah job yang menunggu atau sedang berjalan.
@@ -207,11 +223,11 @@ func (s *Sizer) walk(path string, gen uint64, live *atomic.Int64) Info {
 		if IsRealDir(e) {
 			child := filepath.Join(path, e.Name())
 			select {
-			case s.sem <- struct{}{}:
+			case Slots <- struct{}{}:
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					defer func() { <-s.sem }()
+					defer func() { <-Slots }()
 					merge(s.walk(child, gen, live))
 				}()
 			default:

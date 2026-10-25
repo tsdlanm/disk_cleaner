@@ -2,6 +2,7 @@
 package ui
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -16,10 +17,15 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
 
+	"github.com/tsdlanm/cli_app/internal/analyze"
+
 	"github.com/tsdlanm/cli_app/internal/drives"
 	"github.com/tsdlanm/cli_app/internal/format"
+
+	"github.com/tsdlanm/cli_app/internal/recent"
 	"github.com/tsdlanm/cli_app/internal/sizer"
 	"github.com/tsdlanm/cli_app/internal/trash"
+	"github.com/tsdlanm/cli_app/internal/watch"
 )
 
 const tickInterval = 100 * time.Millisecond
@@ -74,6 +80,42 @@ type model struct {
 
 	marks map[string]bool      // path item yang ditandai di folder ini
 	trash func([]string) error // memindahkan item ke Recycle Bin
+
+	cfg         analyze.Config
+	newProvider func(analyze.Config) (analyze.Provider, error)
+	an          *analysis // layar analisis AI yang sedang terbuka
+	lastAn      *analysis // analisis terakhir, bisa dibuka lagi dengan b
+	anSeq       int       // nomor analisis terakhir; pesan dari analisis lama diabaikan
+	settings    *settings // layar Pengaturan AI yang sedang terbuka
+
+	autoRecent    bool // pindai file baru saat daftar drive pertama kali dimuat
+	recentStarted bool
+	recentRunning bool
+	recentCancel  context.CancelFunc
+	recentProg    *recent.Progress
+	recent        *recent.Report
+	recentErr     error
+	recentShown   map[string]int // jumlah folder yang ditampilkan per drive
+	recentAt      time.Time      // waktu pemindaian data yang sedang tampil
+
+	focusRecent bool // kursor ada di bagian "File baru"
+	rcursor     int
+	roffset     int
+	rgroups     map[int]driveGroups   // folder berisi file baru per drive; nil = susun ulang
+	rexpand     map[string]bool       // drive yang bagian cache/aplikasi/sistem-nya dibuka
+	rnew        *newIndex             // penanda file baru di explorer; nil = susun ulang
+	snapDirs    map[string]sizer.Info // ukuran folder dari pemindaian, untuk snapshot
+	dataFresh   time.Time             // data "File baru" lengkap sampai saat ini
+
+	// background: saat mulai, nyalakan pemantauan langsung (dimatikan di tes).
+	background bool
+	watcher    *watch.Watcher
+	liveSince  time.Time // pemantauan berjalan sejak
+	liveLost   bool      // sebagian perubahan terlewat
+	liveDirty  bool      // ada perubahan yang belum disimpan ke snapshot
+	liveSaved  time.Time
+	liveBuf    []recent.Change // perubahan selama pemindaian penuh berjalan
+	drivesAt   time.Time       // terakhir ruang drive dibaca ulang karena ada perubahan
 }
 
 // popup menampilkan informasi (analisis AI) atau konfirmasi hapus.
@@ -81,6 +123,7 @@ type popup struct {
 	title   string
 	lines   []string
 	confirm []string // path yang dihapus jika dikonfirmasi; nil untuk popup info
+	hint    string   // teks tombol di bawah popup; kosong memakai bawaan
 }
 
 // Options mengatur TUI saat dijalankan.
@@ -100,14 +143,26 @@ type Result struct {
 func Run(opts Options) (Result, error) {
 	m := newModel(sizer.New())
 	m.admin, m.status, m.start = opts.Admin, opts.Status, opts.StartPath
-	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
+	cfg, err := analyze.LoadConfig()
+	if err != nil {
+		m.status = "Konfigurasi AI tidak terbaca, memakai bawaan: " + err.Error()
+	}
+	m.cfg = cfg
+	m.autoRecent, m.background = true, true
+
+	_, err = tea.NewProgram(m, tea.WithAltScreen()).Run()
+	m.stopLive()
+	if err != nil {
 		return Result{}, err
 	}
 	return Result{Elevate: m.elevate, Path: m.path}, nil
 }
 
 func newModel(sz *sizer.Sizer) *model {
-	return &model{sz: sz, remember: make(map[string]string), marks: make(map[string]bool), trash: trash.Move}
+	return &model{
+		sz: sz, remember: make(map[string]string), marks: make(map[string]bool), trash: trash.Move,
+		cfg: analyze.DefaultConfig, newProvider: analyze.Config.NewProvider,
+	}
 }
 
 func (m *model) Init() tea.Cmd {
@@ -125,32 +180,38 @@ func loadDrives() tea.Msg {
 // ukuran subfolder diisi kemudian oleh sizer.
 func loadDir(path string) tea.Cmd {
 	return func() tea.Msg {
-		entries, err := os.ReadDir(path)
-		if err != nil && len(entries) == 0 {
-			return dirMsg{path: path, err: err}
-		}
-		rows := make([]row, 0, len(entries))
-		for _, e := range entries {
-			r := row{name: e.Name(), path: filepath.Join(path, e.Name())}
-			switch {
-			case sizer.IsRealDir(e):
-				r.isDir = true
-			case e.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0:
-				r.link = true
-				r.state = sizer.Done
-				if fi, err := os.Stat(r.path); err == nil {
-					r.isDir = fi.IsDir()
-				}
-			default:
-				r.state = sizer.Done
-				if fi, err := e.Info(); err == nil {
-					r.size = fi.Size()
-				}
-			}
-			rows = append(rows, r)
-		}
-		return dirMsg{path: path, rows: rows}
+		rows, err := readDir(path)
+		return dirMsg{path: path, rows: rows, err: err}
 	}
+}
+
+// readDir membaca isi folder sebagai baris.
+func readDir(path string) ([]row, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil && len(entries) == 0 {
+		return nil, err
+	}
+	rows := make([]row, 0, len(entries))
+	for _, e := range entries {
+		r := row{name: e.Name(), path: filepath.Join(path, e.Name())}
+		switch {
+		case sizer.IsRealDir(e):
+			r.isDir = true
+		case e.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0:
+			r.link = true
+			r.state = sizer.Done
+			if fi, err := os.Stat(r.path); err == nil {
+				r.isDir = fi.IsDir()
+			}
+		default:
+			r.state = sizer.Done
+			if fi, err := e.Info(); err == nil {
+				r.size = fi.Size()
+			}
+		}
+		rows = append(rows, r)
+	}
+	return rows, nil
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -160,10 +221,32 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 
 	case drivesMsg:
+		// Kursor tetap di drive yang sama saat daftar dibaca ulang.
+		sel := m.remember[""]
+		if len(m.drives) > 0 && m.path == "" && m.cursor < len(m.drives) {
+			sel = m.drives[m.cursor].Root
+		}
 		m.drives = msg
 		if m.path == "" {
-			m.cursor = m.indexOfDrive(m.remember[""])
+			m.cursor = m.indexOfDrive(sel)
 		}
+
+		if m.autoRecent && !m.recentStarted {
+			m.recentStarted = true
+			// Hasil pemindaian tersimpan dimuat dulu; pemindaian penuh hanya
+			// jika belum ada atau sudah terlalu lama (lihat updateRecent).
+			cmds := []tea.Cmd{loadSnapshot}
+			if m.background {
+				cmds = append(cmds, m.startLive())
+			}
+			cmd = tea.Batch(cmds...)
+		}
+
+	case recentMsg, snapshotMsg, recentTickMsg:
+		cmd = m.updateRecent(msg)
+
+	case liveMsg:
+		cmd = m.updateLive(msg)
 
 	case dirMsg:
 		if msg.err != nil {
@@ -192,10 +275,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cmd = m.startTick()
 
+	case snapMsg, aiMsg, anTickMsg:
+		cmd = m.updateAnalysis(msg)
+
 	case deleteMsg:
+
 		for _, p := range msg.paths {
 			m.sz.Invalidate(p)
+			if _, err := os.Lstat(p); err != nil {
+				for _, an := range []*analysis{m.an, m.lastAn} {
+					if an != nil {
+						an.gone[p] = true
+						delete(an.marks, p)
+					}
+				}
+			}
 		}
+		// Tanpa menunggu pemantauan: item yang terhapus langsung hilang dari "File baru".
+		m.applyRecent(recent.Check(msg.paths, m.recentOptions(), time.Now()))
 		switch {
 		case msg.failed == 0:
 			m.status = fmt.Sprintf("%d item dipindahkan ke Recycle Bin", len(msg.paths))
@@ -204,19 +301,29 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.status = fmt.Sprintf("%d dari %d item gagal dihapus", msg.failed, len(msg.paths))
 		}
-		cmd = tea.Batch(loadDrives, loadDir(m.path))
+		cmd = loadDrives
+		if m.path != "" {
+			cmd = tea.Batch(cmd, loadDir(m.path))
+		}
+		cmd = tea.Batch(cmd, m.reloadExp())
 
 	case tickMsg:
 		m.ticking = false
 		if m.path != "" {
 			m.refresh()
-			if m.pending > 0 {
-				cmd = m.startTick()
-			}
 		}
+		m.refreshExp()
+		cmd = m.startTick()
+
+	case expMsg:
+		cmd = m.updateExp(msg)
 
 	case tea.KeyMsg:
-		cmd = m.handleKey(msg.String())
+		if m.settings != nil {
+			cmd = m.handleSettingsKey(msg)
+		} else {
+			cmd = m.handleKey(msg.String())
+		}
 	}
 	m.clamp()
 	return m, cmd
@@ -224,15 +331,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) handleKey(key string) tea.Cmd {
 	if m.popup != nil {
-		if m.popup.confirm != nil {
+		if p := m.popup; p.confirm != nil {
 			switch key {
 			case "ctrl+c":
 				return tea.Quit
 			case "y", "Y":
-				paths := m.popup.confirm
 				m.popup = nil
-				m.status = fmt.Sprintf("Memindahkan %d item ke Recycle Bin…", len(paths))
-				return m.deleteCmd(paths)
+				m.status = fmt.Sprintf("Memindahkan %d item ke Recycle Bin…", len(p.confirm))
+				return m.deleteCmd(p.confirm)
 			case "n", "N", "esc", "q":
 				m.popup = nil
 			}
@@ -241,12 +347,24 @@ func (m *model) handleKey(key string) tea.Cmd {
 		switch key {
 		case "ctrl+c":
 			return tea.Quit
-		case "esc", "enter", "q", "a":
+		case "esc", "enter", "q":
 			m.popup = nil
 		}
 		return nil
 	}
+	if m.an != nil {
+		return m.handleAnalysisKey(key)
+	}
 	m.status = ""
+	if m.path == "" && m.focusRecent {
+		if cmd, handled := m.handleRecentKey(key); handled {
+			return cmd
+		}
+	}
+	if m.path == "" && key == "tab" {
+		m.focusRecent = m.hasRecentFiles()
+		return nil
+	}
 	switch key {
 	case "up", "k", "down", "j", "pgup", "pgdown", "home", "g", "end", "G":
 		m.follow = true
@@ -278,8 +396,10 @@ func (m *model) handleKey(key string) tea.Cmd {
 		m.cursor = m.count() - 1
 	case "enter", "right", "l":
 		return m.open()
-	case "backspace", "left", "h", "esc":
+	case "backspace", "left", "h":
 		return m.up()
+	case "esc":
+		return m.home()
 	case "s":
 		if m.path != "" {
 			m.byName = !m.byName
@@ -287,7 +407,7 @@ func (m *model) handleKey(key string) tea.Cmd {
 		}
 	case "r":
 		if m.path == "" {
-			return loadDrives
+			return tea.Batch(loadDrives, m.startRecent())
 		}
 		m.sz.Invalidate(m.path)
 		return loadDir(m.path)
@@ -307,7 +427,16 @@ func (m *model) handleKey(key string) tea.Cmd {
 	case "o":
 		m.openExplorer()
 	case "a":
-		m.popup = m.analysisPopup()
+		return m.requestAnalysis()
+	case "p":
+		m.openSettings("", false)
+
+	case "b":
+		if m.lastAn == nil {
+			m.status = "Belum ada hasil analisis AI"
+			return nil
+		}
+		m.an = m.lastAn
 	case "A":
 		if m.admin {
 			m.status = "Sudah berjalan sebagai Administrator"
@@ -340,39 +469,53 @@ func (m *model) deletePopup() *popup {
 		m.status = "Pilih file atau folder di dalam drive untuk dihapus"
 		return nil
 	}
-	targets := m.deleteTargets()
-	if len(targets) == 0 {
+	var items []delItem
+	for _, r := range m.deleteTargets() {
+		items = append(items, delItem{name: r.name, path: r.path, isDir: r.isDir, size: r.size, sizeText: sizeText(r)})
+	}
+	return m.confirmDelete(items)
+}
+
+// delItem adalah satu item di popup konfirmasi hapus.
+type delItem struct {
+	name, path, sizeText string
+	isDir                bool
+	size                 int64
+}
+
+// confirmDelete menyusun popup konfirmasi untuk memindahkan items ke Recycle Bin.
+func (m *model) confirmDelete(items []delItem) *popup {
+	if len(items) == 0 {
 		return nil
 	}
-
 	const maxList = 8
 	var lines []string
 	var total int64
-	paths := make([]string, len(targets))
-	for i, r := range targets {
-		paths[i] = r.path
-		total += r.size
+	paths := make([]string, len(items))
+	for i, it := range items {
+		paths[i] = it.path
+		total += it.size
 		if i < maxList {
-			name := r.name
-			if r.isDir {
+			name := it.name
+			if it.isDir {
 				name += string(filepath.Separator)
 			}
 			name = runewidth.FillRight(runewidth.Truncate(name, 32, "…"), 32)
-			lines = append(lines, fmt.Sprintf("  %s %12s", name, sizeText(r)))
+			lines = append(lines, fmt.Sprintf("  %s %12s", name, it.sizeText))
 		}
 	}
-	if len(targets) > maxList {
-		lines = append(lines, fmt.Sprintf("  … dan %d item lainnya", len(targets)-maxList))
+	if len(items) > maxList {
+		lines = append(lines, fmt.Sprintf("  … dan %d item lainnya", len(items)-maxList))
 	}
 	lines = append(lines, "", "Total   : "+format.Bytes(total))
-	if d := m.driveOf(m.path); d >= 0 && m.drives[d].Kind != "Lokal" {
+	if d := m.driveOf(paths[0]); d >= 0 && m.drives[d].Kind != "Lokal" {
 		lines = append(lines, "", "Peringatan: drive "+m.drives[d].Kind+" biasanya tidak punya Recycle Bin;",
 			"Windows akan meminta konfirmasi untuk menghapus permanen.")
 	}
 	lines = append(lines, "", "Ruang drive baru bertambah setelah Recycle Bin dikosongkan.")
 
 	return &popup{
-		title:   fmt.Sprintf("Pindahkan %d item ke Recycle Bin?", len(targets)),
+		title:   fmt.Sprintf("Pindahkan %d item ke Recycle Bin?", len(items)),
 		lines:   lines,
 		confirm: paths,
 	}
@@ -403,55 +546,6 @@ func (m *model) marked() (n int, size int64) {
 		}
 	}
 	return n, size
-}
-
-// analysisPopup menyusun popup analisis AI untuk item yang dipilih.
-// Analisisnya sendiri belum tersedia; popup baru menampilkan ringkasan item.
-func (m *model) analysisPopup() *popup {
-	var lines []string
-	switch {
-	case m.path == "" && m.cursor < len(m.drives):
-		d := m.drives[m.cursor]
-		lines = []string{
-			"Drive   : " + d.Root + " " + d.Label,
-			"Jenis   : " + d.Kind,
-		}
-		if d.Ready {
-			lines = append(lines,
-				"Terpakai: "+format.Bytes(int64(d.Used()))+" dari "+format.Bytes(int64(d.Total)),
-				"Bebas   : "+format.Bytes(int64(d.Free)))
-		}
-	case m.path != "" && m.cursor < len(m.rows):
-		r := m.rows[m.cursor]
-		kind := "File"
-		if r.isDir {
-			kind = "Folder"
-		}
-		if r.link {
-			kind += " (link)"
-		}
-		lines = []string{
-			"Nama    : " + r.name,
-			"Lokasi  : " + r.path,
-			"Jenis   : " + kind,
-			"Ukuran  : " + sizeText(r),
-		}
-		if m.total > 0 && !r.denied && !r.link {
-			lines[3] += fmt.Sprintf(" (%.1f%% dari folder ini)", float64(r.size)/float64(m.total)*100)
-		}
-		if r.isDir && !r.link {
-			if inf, st := m.sz.Get(r.path); st == sizer.Done {
-				lines = append(lines, "Isi     : "+format.Int(inf.Files)+" file · "+format.Int(inf.Dirs)+" folder")
-			}
-		}
-	default:
-		return nil
-	}
-	lines = append(lines, "",
-		"Analisis dengan AI belum tersedia.",
-		"Nantinya AI akan menjelaskan isi item ini",
-		"dan apakah aman untuk dihapus.")
-	return &popup{title: "Analisis AI", lines: lines}
 }
 
 // open masuk ke drive atau folder yang dipilih.
@@ -500,30 +594,28 @@ func (m *model) up() tea.Cmd {
 	return loadDir(parent)
 }
 
+// home kembali ke layar daftar drive dari folder mana pun, dengan kursor di
+// drive folder tersebut.
+func (m *model) home() tea.Cmd {
+	if m.path == "" {
+		return nil
+	}
+	m.remember[m.path] = m.selectedName()
+	if d := m.driveOf(m.path); d >= 0 {
+		m.remember[""] = m.drives[d].Root
+	}
+	m.path, m.rows = "", nil
+	clear(m.marks)
+	m.cursor = m.indexOfDrive(m.remember[""])
+	return loadDrives
+}
+
 // refresh mengisi ukuran subfolder dari sizer, menjadwalkan yang belum
 // dihitung, lalu mengurutkan ulang. Jika follow, kursor tetap di item yang sama.
 func (m *model) refresh() {
 	sel := m.selectedName()
-	var request []string
-	m.total, m.pending = 0, 0
-	for i := range m.rows {
-		r := &m.rows[i]
-		if r.isDir && !r.link {
-			inf, st := m.sz.Get(r.path)
-			r.size, r.state, r.denied = inf.Size, st, inf.Denied
-			if st == sizer.Unknown {
-				request = append(request, r.path)
-			}
-			if st != sizer.Done {
-				m.pending++
-			}
-		}
-		m.total += r.size
-	}
-	m.sortRows()
-	if len(request) > 0 {
-		m.sz.Request(request...)
-	}
+	m.total, m.pending = fillSizes(m.sz, m.rows)
+	sortRows(m.rows, m.byName)
 	if !m.follow {
 		return
 	}
@@ -532,9 +624,35 @@ func (m *model) refresh() {
 	}
 }
 
-func (m *model) sortRows() {
-	slices.SortStableFunc(m.rows, func(a, b row) int {
-		if m.byName {
+// fillSizes mengisi ukuran subfolder dari sizer dan menjadwalkan yang belum
+// dihitung. Mengembalikan total ukuran dan jumlah folder yang belum selesai.
+func fillSizes(sz *sizer.Sizer, rows []row) (total int64, pending int) {
+	var request []string
+	for i := range rows {
+		r := &rows[i]
+		if r.isDir && !r.link {
+			inf, st := sz.Get(r.path)
+			r.size, r.state, r.denied = inf.Size, st, inf.Denied
+			if st == sizer.Unknown {
+				request = append(request, r.path)
+			}
+			if st != sizer.Done {
+				pending++
+			}
+		}
+		total += r.size
+	}
+	if len(request) > 0 {
+		sz.Request(request...)
+	}
+	return total, pending
+}
+
+// sortRows mengurutkan baris dari yang terbesar, atau menurut nama
+// (folder lebih dulu) jika byName.
+func sortRows(rows []row, byName bool) {
+	slices.SortStableFunc(rows, func(a, b row) int {
+		if byName {
 			if a.isDir != b.isDir {
 				if a.isDir {
 					return -1
@@ -554,7 +672,7 @@ func (m *model) sortRows() {
 }
 
 func (m *model) startTick() tea.Cmd {
-	if m.ticking || m.pending == 0 {
+	if m.ticking || m.pending+m.expPending() == 0 {
 		return nil
 	}
 	m.ticking = true
@@ -562,24 +680,30 @@ func (m *model) startTick() tea.Cmd {
 }
 
 func (m *model) openExplorer() {
-	var line string
 	switch {
 	case m.path == "" && m.cursor < len(m.drives):
-		line = `explorer.exe "` + m.drives[m.cursor].Root + `"`
+		m.status = runExplorer(`explorer.exe "` + m.drives[m.cursor].Root + `"`)
 	case m.path != "" && m.cursor < len(m.rows):
-		line = `explorer.exe /select,"` + m.rows[m.cursor].path + `"`
-	default:
-		return
+		m.status = explorerSelect(m.rows[m.cursor].path)
 	}
+}
+
+// explorerSelect membuka Explorer dengan path terpilih. Mengembalikan pesan
+// error untuk baris status, atau "" jika berhasil.
+func explorerSelect(path string) string {
+	return runExplorer(`explorer.exe /select,"` + path + `"`)
+}
+
+func runExplorer(line string) string {
 	// explorer butuh format /select,"path" yang tidak dihasilkan oleh
 	// escaping argumen bawaan Go, jadi command line ditulis langsung.
 	c := exec.Command("explorer.exe")
 	c.SysProcAttr = &syscall.SysProcAttr{CmdLine: line}
 	if err := c.Start(); err != nil {
-		m.status = "Gagal membuka Explorer: " + err.Error()
-		return
+		return "Gagal membuka Explorer: " + err.Error()
 	}
 	go c.Wait()
+	return ""
 }
 
 func (m *model) count() int {
