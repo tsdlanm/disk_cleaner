@@ -34,9 +34,10 @@ var (
 )
 
 const (
-	keysDrives = "↑↓ pilih · enter buka · tab folder dengan file baru · a analisis AI · r pindai ulang · o Explorer · q keluar"
-	keysRecent = "↑↓ pilih · enter buka folder · a analisis AI · o Explorer · tab/esc kembali ke drive · q keluar"
-	keysDir    = "↑↓ pilih · enter buka · ← folder induk · esc halaman utama · space tandai · d hapus · a analisis AI · s urut · r refresh · o Explorer · q keluar"
+	keysDrives = "↑↓ pilih · enter buka · tab Recycle Bin · a analisis · r pindai · q keluar"
+	keysRecent = "↑↓ pilih · enter masuk · ← tutup drive · a analisis · o Explorer · esc kembali · q keluar"
+	keysBin    = "↑↓ pilih · space tandai · u pulihkan · d hapus · E kosongkan · esc kembali · q keluar"
+	keysDir    = "↑↓ pilih · enter buka · ← naik · space tandai · d hapus · a analisis · o Explorer · q keluar"
 )
 
 func (m *model) listHeight() int {
@@ -54,7 +55,7 @@ func (m *model) View() string {
 		m.viewAnalysis(&b)
 
 	case m.path == "":
-		m.viewDrives(&b)
+		m.viewHome(&b)
 	default:
 		m.viewDir(&b)
 	}
@@ -67,28 +68,76 @@ func (m *model) View() string {
 	return b.String()
 }
 
-// footerKeys menambahkan tombol yang hanya berlaku pada kondisi tertentu.
+// footerKeys menambahkan tombol yang jarang dipakai ke bantuan halaman Drive
+// saja: pengaturan AI. Tombol A (Administrator) dijelaskan di header halaman
+// Drive.
 func (m *model) footerKeys(keys string) string {
-	keys += " · p pengaturan AI"
-	if m.lastAn != nil {
-		keys += " · b hasil AI"
-	}
-	if !m.admin {
-		keys += " · A admin"
-	}
-	return keys
+	return keys + " · p pengaturan"
 }
 
-func (m *model) viewDrives(b *strings.Builder) {
-	m.line(b, titleStyle.Render("Drive"))
-	mode := "Administrator"
-	if !m.admin {
-		mode = "tanpa hak Administrator: folder terkunci tidak ikut terhitung, tekan A untuk restart sebagai Administrator"
-	}
-	m.line(b, dimStyle.Render(fmt.Sprintf("%d drive · %s", len(m.drives), mode)))
-	b.WriteString("\n")
-
+// viewHome menulis halaman utama: baris tab (Drive · Recycle Bin),
+// ringkasan halaman yang terbuka, lalu isinya. Halaman Drive memuat bagian
+// "File baru" di bawah daftar drive.
+func (m *model) viewHome(b *strings.Builder) {
+	m.line(b, m.tabs())
 	h := m.listHeight()
+	used := 0
+	keys := keysDrives
+	switch m.page {
+	case pageBin:
+		m.line(b, m.binSummary())
+		m.line(b, m.binTopLine())
+		used = m.viewBinList(b, h)
+		keys = keysBin
+	default:
+		mode := "Administrator"
+		if !m.admin {
+			mode = "tanpa hak Administrator: folder terkunci tidak ikut terhitung, tekan A untuk restart sebagai Administrator"
+		}
+		m.line(b, dimStyle.Render(fmt.Sprintf("%d drive · %s", len(m.drives), mode)))
+		b.WriteString("\n")
+		used = m.viewDrives(b, h)
+		if h-used > 3 {
+			b.WriteString("\n")
+			used++
+			used += m.viewRecent(b, h-used)
+		}
+		if m.focusRecent {
+			keys = keysRecent
+		}
+	}
+	for range h - used {
+		b.WriteString("\n")
+	}
+	if m.page == pageDrives && !m.focusRecent {
+		keys = m.footerKeys(keys)
+	}
+	m.footer(b, keys)
+}
+
+// tabs adalah baris judul halaman utama; halaman yang terbuka ditebalkan.
+func (m *model) tabs() string {
+	names := []string{"Drive", "Recycle Bin"}
+	if m.binLoaded && m.binErr == nil {
+		var size int64
+		for _, it := range m.binItems {
+			size += it.Size
+		}
+		names[pageBin] += fmt.Sprintf(" (%d · %s)", len(m.binItems), format.Bytes(size))
+	}
+	var parts []string
+	for i, n := range names {
+		if i == m.page {
+			parts = append(parts, titleStyle.Underline(true).Render(n))
+		} else {
+			parts = append(parts, dimStyle.Render(n))
+		}
+	}
+	return strings.Join(parts, dimStyle.Render("  │  ")) + dimStyle.Render("    tab pindah halaman")
+}
+
+// viewDrives menulis daftar drive dalam paling banyak h baris.
+func (m *model) viewDrives(b *strings.Builder, h int) int {
 	used := 0
 	for i := m.offset; i < min(m.offset+h, len(m.drives)); i++ {
 		used++
@@ -113,21 +162,7 @@ func (m *model) viewDrives(b *strings.Builder) {
 
 		m.line(b, fmt.Sprintf(" %s  %s  %s  %4.0f%%  %s  %s", name, kind, usage, frac*100, barStyle.Render(bar(frac)), free))
 	}
-
-	// Bagian "File baru" mengisi ruang kosong di bawah daftar drive.
-	if h-used > 4 {
-		b.WriteString("\n")
-		used++
-		used += m.viewRecent(b, h-used)
-	}
-	for range h - used {
-		b.WriteString("\n")
-	}
-	if m.focusRecent {
-		m.footer(b, m.footerKeys(keysRecent))
-	} else {
-		m.footer(b, m.footerKeys(keysDrives))
-	}
+	return used
 }
 
 func (m *model) viewDir(b *strings.Builder) {
@@ -135,7 +170,7 @@ func (m *model) viewDir(b *strings.Builder) {
 
 	summary := fmt.Sprintf("%s · %s item", format.Bytes(m.total), format.Int(int64(len(m.rows))))
 	if n := m.newFiles().dirs[filepath.Clean(m.path)]; n > 0 {
-		summary += fmt.Sprintf(" · %s file baru di sini (%d hari)", format.Int(int64(n)), m.days())
+		summary += fmt.Sprintf(" · %s file baru di sini (24 jam)", format.Int(int64(n)))
 	}
 	if m.pending > 0 {
 		summary += fmt.Sprintf(" · menghitung %d folder…", m.pending)
@@ -143,11 +178,7 @@ func (m *model) viewDir(b *strings.Builder) {
 	if d := m.driveOf(m.path); d >= 0 {
 		summary += fmt.Sprintf(" · drive %s %s bebas", m.drives[d].Root, format.Bytes(int64(m.drives[d].Free)))
 	}
-	sort := "ukuran"
-	if m.byName {
-		sort = "nama"
-	}
-	summary += " · urut " + sort
+	summary += " · terbesar dulu"
 	m.line(b, dimStyle.Render(summary))
 	b.WriteString("\n")
 
@@ -186,12 +217,12 @@ func (m *model) viewDir(b *strings.Builder) {
 		size = fmt.Sprintf("%11s", size)
 		pct = fmt.Sprintf("%6s", pct)
 
-		// Penanda file baru (dari "File baru"), atau jumlah file baru di dalam folder.
+		// Penanda file baru (24 jam terakhir), atau jumlah file baru di dalam folder.
 		tag := ""
 		created, isNew := m.newFiles().files[r.path]
 		switch {
 		case isNew:
-			tag = newStyle.Render("● baru · " + relTime(created))
+			tag = newStyle.Render("● baru · " + clockTime(created))
 		case r.isDir:
 			if n := m.newFiles().dirs[r.path]; n > 0 {
 				tag = newStyle.Render(fmt.Sprintf("%s file baru", format.Int(int64(n))))
@@ -218,7 +249,7 @@ func (m *model) viewDir(b *strings.Builder) {
 		m.line(b, fmt.Sprintf("%s%s  %s  %s  %s  %s", mark, name, size, pct, barStyle.Render(br), tag))
 	}
 	m.pad(b, len(m.rows))
-	m.footer(b, m.footerKeys(keysDir))
+	m.footer(b, keysDir)
 }
 
 func sizeText(r row) string {
@@ -271,7 +302,7 @@ func (m *model) renderPopup(p *popup) string {
 	maxW := max(m.screenWidth()-8, 20)
 	var b strings.Builder
 	style, hint := titleStyle, "esc tutup"
-	if p.confirm != nil {
+	if p.confirm != nil || p.onYes != nil {
 		style, hint = dangerStyle, "y hapus · n/esc batal"
 	}
 	if p.hint != "" {

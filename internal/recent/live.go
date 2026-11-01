@@ -19,9 +19,16 @@ type Change struct {
 // path, jadi panggil di luar goroutine UI.
 func Check(paths []string, opt Options, now time.Time) []Change {
 	opt = opt.withDefaults()
-	since := now.AddDate(0, 0, -opt.Days)
+	since := now.Add(-Window)
 	out := make([]Change, 0, len(paths))
-	for _, p := range paths {
+	norm := NewNormalizer()
+	// Folder yang diabaikan juga memakai ejaan panjang, agar cocok dengan path di atas.
+	opt.Ignore = slices.Clone(opt.Ignore)
+	for i, dir := range opt.Ignore {
+		opt.Ignore[i] = norm.Path(dir)
+	}
+	for _, raw := range paths {
+		p := norm.Path(raw) // satu file, satu ejaan: lihat longpath.go
 		c := Change{Path: p}
 		fi, err := os.Lstat(p)
 		switch {

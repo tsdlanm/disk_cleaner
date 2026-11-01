@@ -46,6 +46,12 @@ func loadSnapshot() tea.Msg {
 	if err != nil {
 		return snapshotMsg{}
 	}
+	if snap.Report != nil {
+		// Hasil tersimpan bisa memuat path berejaan pendek, dan file yang sudah
+		// hilang selagi program tertutup; rapikan sebelum ditampilkan.
+		snap.Report.Normalize()
+		snap.Report.PruneMissing()
+	}
 	return snapshotMsg{snap: snap}
 }
 
@@ -58,17 +64,9 @@ func (m *model) rescanAge() time.Duration {
 	return time.Duration(h) * time.Hour
 }
 
-// days adalah rentang "File baru" dari konfigurasi.
-func (m *model) days() int {
-	if m.cfg.RecentDays > 0 {
-		return m.cfg.RecentDays
-	}
-	return recent.DefaultOptions.Days
-}
-
 // recentOptions adalah pengaturan pemindaian dan pemeriksaan file baru.
 func (m *model) recentOptions() recent.Options {
-	opt := recent.Options{Days: m.days(), MinFile: m.cfg.RecentMinKB << 10}
+	opt := recent.Options{MinFile: m.cfg.RecentMinKB << 10}
 	if base := dataDir(); base != "" {
 		opt.Ignore = []string{base}
 	}
@@ -111,7 +109,7 @@ func (m *model) startRecent() tea.Cmd {
 	}
 	scan := func() tea.Msg {
 		start := time.Now()
-		rep, err := recent.Scan(ctx, rootList, opt, base, prog)
+		rep, err := recent.Scan(ctx, rootList, opt, prog)
 		if err == nil && base != "" {
 			_ = recent.SaveSnapshot(recent.SnapshotPath(base), &recent.Snapshot{Time: start, Report: rep, Dirs: dirs})
 		}
@@ -165,13 +163,12 @@ func (m *model) updateRecent(msg tea.Msg) tea.Cmd {
 func (m *model) setRecent(rep *recent.Report, at time.Time) {
 	m.recent, m.recentAt = rep, at
 	m.liveSaved = time.Now() // data ini baru dimuat/disimpan
-	m.recentShown = make(map[string]int)
-	m.rcursor, m.roffset = 0, 0
+	m.rcursor, m.roffset, m.rshown = 0, 0, nil
 	m.recentChanged()
 }
 
 // applyRecent menerapkan perubahan ke "File baru" dengan kursor tetap di
-// folder yang sama. Mengembalikan true jika ada yang berubah.
+// file yang sama. Mengembalikan true jika ada yang berubah.
 func (m *model) applyRecent(changes []recent.Change) bool {
 	if m.recent == nil {
 		return false
@@ -186,9 +183,9 @@ func (m *model) applyRecent(changes []recent.Change) bool {
 	return true
 }
 
-// recentChanged membuang daftar folder yang sudah disusun setelah datanya berubah.
+// recentChanged membuang daftar file yang sudah disusun setelah datanya berubah.
 func (m *model) recentChanged() {
-	m.rgroups, m.rnew = nil, nil
+	m.rfiles, m.rplaces, m.rnew = nil, nil, nil
 }
 
 // newIndex menandai file baru di explorer: waktu dibuat setiap file baru, dan
@@ -198,28 +195,19 @@ type newIndex struct {
 	dirs  map[string]int
 }
 
-// newFiles mengembalikan indeks file baru dalam rentang "File baru".
+// newFiles mengembalikan indeks file baru dalam rentang "File baru" (24 jam).
 func (m *model) newFiles() *newIndex {
 	if m.rnew != nil {
 		return m.rnew
 	}
 	x := &newIndex{files: make(map[string]time.Time), dirs: make(map[string]int)}
 	m.rnew = x
-	if m.recent == nil {
-		return x
-	}
-	since := time.Now().AddDate(0, 0, -m.days())
-	for _, d := range m.recent.Drives {
-		for _, f := range d.Files {
-			if f.Created.Before(since) {
-				break // urut dari yang terbaru
-			}
-			x.files[f.Path] = f.Created
-			for p := filepath.Dir(f.Path); ; p = filepath.Dir(p) {
-				x.dirs[p]++
-				if filepath.Dir(p) == p {
-					break
-				}
+	for _, f := range m.recentFiles() {
+		x.files[f.Path] = f.Created
+		for p := filepath.Dir(f.Path); ; p = filepath.Dir(p) {
+			x.dirs[p]++
+			if filepath.Dir(p) == p {
+				break
 			}
 		}
 	}

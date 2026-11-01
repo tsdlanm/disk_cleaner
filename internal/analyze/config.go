@@ -21,7 +21,6 @@ type Config struct {
 	MaxLines  int    `json:"max_lines"`   // batas baris ringkasan
 	MinSizeMB int64  `json:"min_size_mb"` // batas bawah item yang dirinci
 
-	RecentDays  int   `json:"recent_days"`   // rentang "baru ditambahkan" di layar utama
 	RecentMinKB int64 `json:"recent_min_kb"` // file baru di bawah ini tidak didaftar (tetap dihitung)
 	RescanHours int   `json:"rescan_hours"`  // hasil pemindaian tersimpan dipakai ulang selama ini, lalu dipindai ulang otomatis
 }
@@ -70,7 +69,6 @@ var DefaultConfig = Config{
 	MaxLines:  DefaultLimits.MaxLines,
 	MinSizeMB: DefaultLimits.MinSize >> 20,
 
-	RecentDays:  7,
 	RecentMinKB: 1024,
 	RescanHours: 6,
 }

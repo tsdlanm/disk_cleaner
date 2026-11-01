@@ -3,21 +3,25 @@ package ui
 import (
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/tsdlanm/cli_app/internal/bin"
 	"github.com/tsdlanm/cli_app/internal/drives"
 	"github.com/tsdlanm/cli_app/internal/recent"
 	"github.com/tsdlanm/cli_app/internal/sizer"
 )
 
+// tempDir membuat folder uji berejaan panjang, seperti drive yang dipindai
+// dari C:\ (t.TempDir mengikuti TEMP yang bisa berejaan pendek 8.3).
+func tempDir(t *testing.T) string { return recent.LongPath(t.TempDir()) }
+
 func TestLiveUpdate(t *testing.T) {
 	t.Setenv("LOCALAPPDATA", t.TempDir())
-	root := t.TempDir()
+	root := tempDir(t)
 	vol := filepath.VolumeName(root) + `\`
 	oldDir, newDir := filepath.Join(root, "lama"), filepath.Join(root, "unduhan")
 	old := filepath.Join(oldDir, "a.bin")
@@ -28,27 +32,26 @@ func TestLiveUpdate(t *testing.T) {
 	m.Update(recentMsg{rep: &recent.Report{Drives: []recent.DriveReport{{
 		Root: vol, Files: []recent.File{{Path: old, Size: 2 << 20, Created: time.Now().Add(-time.Hour)}},
 	}}}, at: time.Now()})
-	// File tes ada di folder Temp (label cache): buka bagian cache dulu.
-	m.rexpand = map[string]bool{vol: true}
-	key(m, "tab")
+	key(m, "down") // judul drive
 	key(m, "down")
-	if m.selectedRecent() != oldDir {
-		t.Fatalf("kursor = %q", m.selectedRecent())
+	sel := m.selectedRecent()
+	if sel == "" {
+		t.Fatal("kursor tidak di File baru")
 	}
 	run(m, loadDir(root))
 	before := len(m.rows)
 
-	// File baru di folder lain: foldernya masuk di atas, kursor tetap di
-	// folder yang sama, dan folder yang sedang dibuka ikut dimuat ulang.
+	// File baru di folder lain: masuk di atas, kursor tetap di file yang
+	// sama, dan folder yang sedang dibuka ikut dimuat ulang.
 	nf := filepath.Join(newDir, "x.iso")
 	write(t, nf, 3<<20)
 	opt := m.recentOptions()
 	_, cmd := m.Update(liveMsg{changes: recent.Check([]string{nf, newDir}, opt, time.Now()), dirs: map[string]bool{root: true, newDir: true}})
-	if g := allGroups(m); len(g) != 2 || g[0].dir != newDir {
-		t.Fatalf("groups = %+v", g)
+	if f := m.recentFiles(); len(f) != 2 || f[0].Path != nf {
+		t.Fatalf("file = %+v", f)
 	}
-	if m.selectedRecent() != oldDir {
-		t.Errorf("kursor pindah ke %q", m.selectedRecent())
+	if m.selectedRecent() != sel {
+		t.Errorf("kursor pindah dari %q ke %q", sel, m.selectedRecent())
 	}
 	if !m.liveDirty {
 		t.Error("perubahan tidak ditandai untuk disimpan")
@@ -66,8 +69,8 @@ func TestLiveUpdate(t *testing.T) {
 	// Folder dihapus: hilang dari daftar.
 	os.RemoveAll(oldDir)
 	m.Update(liveMsg{changes: recent.Check([]string{oldDir}, opt, time.Now())})
-	if g := allGroups(m); len(g) != 1 || g[0].dir != newDir {
-		t.Errorf("setelah hapus: %+v", g)
+	if f := m.recentFiles(); len(f) != 1 || f[0].Path != nf {
+		t.Errorf("setelah hapus: %+v", f)
 	}
 
 	// Disimpan ke snapshot. Data dibuat setelah pemantauan mulai, jadi lengkap
@@ -92,8 +95,82 @@ func TestLiveUpdate(t *testing.T) {
 	}
 }
 
+// g / Home melompat ke baris pertama, G / End ke baris terakhir, di setiap
+// layar yang punya daftar.
+func TestJumpFirstLast(t *testing.T) {
+	root := tempDir(t)
+	for _, n := range []string{"a", "b", "c", "d"} {
+		write(t, filepath.Join(root, n+".txt"), 10)
+	}
+	m := newModel(sizer.New())
+	m.binList = func([]string) ([]bin.Item, error) {
+		return []bin.Item{
+			{Original: `C:\1.iso`, Info: `C:\$Recycle.Bin\S\$I1`, Size: 3},
+			{Original: `C:\2.iso`, Info: `C:\$Recycle.Bin\S\$I2`, Size: 2},
+			{Original: `C:\3.iso`, Info: `C:\$Recycle.Bin\S\$I3`, Size: 1},
+		}, nil
+	}
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.Update(drivesMsg{{Root: `C:\`, Ready: true}, {Root: `D:\`, Ready: true}, {Root: `E:\`, Ready: true}})
+
+	// Daftar drive.
+	key(m, "G")
+	if m.cursor != 2 {
+		t.Errorf("drive: G → %d, want 2", m.cursor)
+	}
+	key(m, "g")
+	if m.cursor != 0 {
+		t.Errorf("drive: g → %d, want 0", m.cursor)
+	}
+
+	// File baru: g ke baris pertama (judul drive), G ke baris terakhir.
+	m.Update(recentMsg{rep: recentReport(3, `C:\`, `D:\`)})
+	key(m, "G")    // drive terakhir
+	key(m, "down") // turun ke File baru
+	if !m.focusRecent {
+		t.Fatal("↓ dari drive terakhir tidak masuk ke File baru")
+	}
+	key(m, "down")
+	key(m, "G")
+	if last := len(recentSelectable(m.recentLines())) - 1; m.rcursor != last {
+		t.Errorf("File baru: G → %d, want %d", m.rcursor, last)
+	}
+	key(m, "g")
+	if m.rcursor != 0 {
+		t.Errorf("File baru: g → %d, want 0", m.rcursor)
+	}
+	key(m, "esc") // kembali ke daftar drive
+
+	// Recycle Bin.
+	key(m, "tab")
+	key(m, "G")
+	if m.bcursor != 2 {
+		t.Errorf("Recycle Bin: G → %d, want 2", m.bcursor)
+	}
+	key(m, "g") // baris pertama adalah tombol "Kosongkan Recycle Bin"
+	if m.bcursor != binButton {
+		t.Errorf("Recycle Bin: g → %d, want tombol Kosongkan (%d)", m.bcursor, binButton)
+	}
+	key(m, "down")
+	if m.bcursor != 0 {
+		t.Errorf("Recycle Bin: ↓ dari tombol → %d, want item pertama (0)", m.bcursor)
+	}
+
+	// Isi folder.
+	run(m, loadDir(root))
+	settle(t, m)
+	key(m, "G")
+	if m.cursor != 3 {
+		t.Errorf("folder: G → %d, want 3", m.cursor)
+	}
+	key(m, "g")
+	if m.cursor != 0 {
+		t.Errorf("folder: g → %d, want 0", m.cursor)
+	}
+}
+
 func TestEscHome(t *testing.T) {
-	root := t.TempDir()
+	root := tempDir(t)
 	deep := filepath.Join(root, "a", "b")
 	write(t, filepath.Join(deep, "x.txt"), 10)
 	m := newModel(sizer.New())
@@ -126,7 +203,7 @@ func TestDrivesReloadKeepsCursor(t *testing.T) {
 }
 
 func TestNewMarkers(t *testing.T) {
-	root := t.TempDir()
+	root := tempDir(t)
 	dl := filepath.Join(root, "dl")
 	a, b := filepath.Join(dl, "a.iso"), filepath.Join(dl, "b.zip")
 	sub := filepath.Join(dl, "sub", "c.bin")
@@ -144,17 +221,12 @@ func TestNewMarkers(t *testing.T) {
 		},
 	}}}})
 
-	// Folder dl adalah yang terbaru; enter membukanya dengan kursor di file terbarunya.
-	m.rexpand = map[string]bool{filepath.VolumeName(root) + `\`: true} // folder tes berlabel cache
-	key(m, "tab")
-	key(m, "down")
-	key(m, "enter")
-	if m.path != dl || m.rows[m.cursor].name != "b.zip" {
-		t.Fatalf("enter: path %s, kursor di %q", m.path, m.rows[m.cursor].name)
-	}
+	run(m, loadDir(dl))
 	settle(t, m)
+	// File baru ditandai di explorer; subfolder berisi file baru diberi jumlahnya.
 	v := m.View()
-	for _, want := range []string{"3 file baru di sini", "● baru · 1 jam lalu", "● baru · 3 jam lalu", "1 file baru"} {
+	for _, want := range []string{"3 file baru di sini (24 jam)", "● baru · " + now.Add(-time.Hour).Format("15:04") + " · 1 jam lalu",
+		"● baru · " + now.Add(-3*time.Hour).Format("15:04") + " · 3 jam lalu", "1 file baru"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("View tidak memuat %q:\n%s", want, v)
 		}
@@ -164,32 +236,4 @@ func TestNewMarkers(t *testing.T) {
 			t.Errorf("file lama ikut ditandai baru: %q", l)
 		}
 	}
-}
-
-func TestRecentScrollKeepsDriveTitle(t *testing.T) {
-	m := newModel(sizer.New())
-	m.Update(tea.WindowSizeMsg{Width: 140, Height: 12})
-	m.Update(recentMsg{rep: recentReport(25, `C:\`, `D:\`)})
-	key(m, "tab")
-	for range 8 {
-		key(m, "down")
-	}
-	if strings.Contains(m.View(), `C:\ · 25 folder`) {
-		t.Fatal("daftar tidak tergulir; tes tidak menguji apa-apa")
-	}
-	for range 8 {
-		key(m, "up")
-	}
-	if v := m.View(); !strings.Contains(v, `C:\ · 25 folder`) {
-		t.Errorf("judul drive C hilang saat kursor di folder pertamanya:\n%s", v)
-	}
-}
-
-// allGroups mengembalikan semua folder di drive pertama, pengguna maupun
-// cache (file di folder Temp tes berlabel cache), urut dari yang terbaru.
-func allGroups(m *model) []folderGroup {
-	g := m.groups(0)
-	all := append(append([]folderGroup{}, g.user...), g.other...)
-	slices.SortFunc(all, func(a, b folderGroup) int { return b.newest.Compare(a.newest) })
-	return all
 }

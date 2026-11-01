@@ -136,14 +136,14 @@ func TestAnalyzeTolerant(t *testing.T) {
 	s := &Snapshot{Items: map[int]Item{2: {ID: 2, Path: `C:\x\cache`, IsDir: true}}}
 
 	// JSON dibungkus blok kode dan teks lain tetap terbaca.
-	p := &fakeProvider{replies: []string{"Berikut hasilnya:\n```json\n{\"answer\":\"• [[2]] cache\",\"mentions\":[{\"id\":2,\"action\":\"hapus\"}]}\n```"}}
+	p := &fakeProvider{replies: []string{"Berikut hasilnya:\n```json\n{\"summary\":\"s\",\"items\":[{\"id\":2,\"action\":\"hapus\",\"reason\":\"cache\"}]}\n```"}}
 	res, err := Analyze(t.Context(), p, s)
 	if err != nil || res.Mentions[2].Action != ActionDelete {
 		t.Fatalf("res %+v err %v", res, err)
 	}
 
 	// Jawaban bukan JSON: diulang sekali dengan pengingat format.
-	p = &fakeProvider{replies: []string{"maaf, ini bukan json", `{"answer":"ok","mentions":[]}`}}
+	p = &fakeProvider{replies: []string{"maaf, ini bukan json", `{"summary":"ok","items":[]}`}}
 	if res, err := Analyze(t.Context(), p, s); err != nil || res.Text != "ok" {
 		t.Fatalf("ulang: res %+v err %v", res, err)
 	}
@@ -151,19 +151,28 @@ func TestAnalyzeTolerant(t *testing.T) {
 		t.Errorf("permintaan ulang tanpa pengingat: %q", p.users)
 	}
 
-	// Tidak menyebut satu pun folder (kasus nyata gemini flash-lite): diulang
-	// sekali dengan pengingat untuk menyebut semua folder.
-	s.Items[1] = Item{ID: 1, Path: `C:\x`, IsDir: true}
+	// Item wajib yang terlewat (kasus nyata model kecil) ditanyakan ulang, hanya
+	// id yang kurang; penilaian pertama tetap dipakai.
+	s.Items[3] = Item{ID: 3, Path: `C:\x\npm-cache`, IsDir: true}
+	s.Candidates = []Candidate{{ID: 2}, {ID: 3}}
 	p = &fakeProvider{replies: []string{
-		`{"answer":"Ringkasan saja.","mentions":[]}`,
-		`{"answer":"Aman dihapus:\n• [[2]] cache","mentions":[{"id":2,"action":"hapus","reason":"cache"}]}`,
+		`{"summary":"Ringkasan.","items":[{"id":2,"action":"hapus","reason":"Cache."}]}`,
+		`{"summary":"","items":[{"id":3,"action":"hapus","reason":"Cache npm."},{"id":2,"action":"cek","reason":"ganti"}]}`,
 	}}
 	res, err = Analyze(t.Context(), p, s)
-	if err != nil || len(res.Mentions) != 1 || len(p.users) != 2 || !strings.Contains(p.users[1], "tidak menyebut satu pun") {
-		t.Errorf("ulang tanpa sebutan: res %+v err %v permintaan %d", res, err, len(p.users))
+	if err != nil || len(p.users) != 2 || !strings.Contains(p.users[1], "belum menilai item dengan id berikut: 3.") {
+		t.Fatalf("ulang item terlewat: err %v permintaan %q", err, p.users)
+	}
+	if res.Mentions[2].Reason != "Cache." || res.Mentions[3].Reason != "Cache npm." || !strings.HasPrefix(res.Text, "Ringkasan.") {
+		t.Errorf("hasil gabungan: %+v\n%s", res.Mentions, res.Text)
+	}
+
+	// Lengkap sejak awal: tidak ada permintaan ulang.
+	p = &fakeProvider{replies: []string{`{"summary":"s","items":[{"id":2,"action":"hapus","reason":"a"},{"id":3,"action":"cek","reason":"b"}]}`}}
+	if _, err := Analyze(t.Context(), p, s); err != nil || len(p.users) != 1 {
+		t.Errorf("lengkap: err %v permintaan %d", err, len(p.users))
 	}
 }
-
 func TestCleanToken(t *testing.T) {
 	// NUL di depan (kasus nyata dari paste), baris baru, spasi, dan karakter
 	// tak terlihat dibuang; isi key tetap utuh.

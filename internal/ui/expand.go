@@ -41,6 +41,8 @@ type stop struct {
 	line    int
 	parent  int // indeks stop induk; -1 untuk penyebutan AI
 	mention bool
+	action  analyze.Action // saran AI untuk penyebutan; kosong jika tidak ada
+	reason  string         // alasan singkat dari AI, bila ada
 }
 
 func loadExp(path string) tea.Cmd {
@@ -77,7 +79,7 @@ func (m *model) refreshExp() {
 	for _, e := range m.lastAn.exp {
 		if e.loaded {
 			e.total, e.pending = fillSizes(m.sz, e.rows)
-			sortRows(e.rows, false)
+			sortRows(e.rows)
 		}
 	}
 }
@@ -148,10 +150,11 @@ func (m *model) emitTree(an *analysis, lines *[]string, stops *[]stop, parent in
 			branch, below = "└ ", "   "
 		}
 		idx := len(*stops)
-		key := "c:" + r.path
+		// Kunci memuat induknya: folder yang sama bisa terbuka di dua jawaban.
+		key := (*stops)[parent].key + ">" + r.path
 		*stops = append(*stops, stop{key: key, path: r.path, isDir: r.isDir && !r.link, size: r.size,
 			line: len(*lines), parent: parent})
-		text := m.childChip(an, r, key == an.curKey, w-runewidth.StringWidth(indent)-2)
+		text := m.childChip(an, r, an.itemsFocus && key == an.curKey, w-runewidth.StringWidth(indent)-2)
 		*lines = append(*lines, dimStyle.Render(indent+branch)+text)
 		if r.isDir {
 			m.emitTree(an, lines, stops, idx, r.path, indent+below, w)
@@ -162,7 +165,7 @@ func (m *model) emitTree(an *analysis, lines *[]string, stops *[]stop, parent in
 	}
 }
 
-// childChip menyusun tampilan satu isi folder: ▸/▾ untuk folder, [nama · ukuran].
+// childChip menyusun tampilan satu isi folder: ▸/▾ untuk folder, nama · ukuran.
 func (m *model) childChip(an *analysis, r row, selected bool, maxW int) string {
 	name := r.name
 	marker := ""
@@ -177,14 +180,14 @@ func (m *model) childChip(an *analysis, r row, selected bool, maxW int) string {
 	if an.gone[r.path] {
 		tail = " · terhapus"
 	}
-	prefix := "["
+	prefix := ""
 	if an.marks[r.path] {
-		prefix = "[✓ "
+		prefix = "✓ "
 	}
-	if room := maxW - runewidth.StringWidth(marker+prefix+tail+"]"); runewidth.StringWidth(name) > room {
+	if room := maxW - runewidth.StringWidth(marker+prefix+tail); runewidth.StringWidth(name) > room {
 		name = runewidth.Truncate(name, max(room, 8), "…")
 	}
-	plain := prefix + name + tail + "]"
+	plain := prefix + name + tail
 
 	var style lipgloss.Style
 	switch {
@@ -203,7 +206,8 @@ func (m *model) childChip(an *analysis, r row, selected bool, maxW int) string {
 	return dimStyle.Render(marker) + style.Render(plain)
 }
 
-// mentionStop membuat stop untuk penyebutan AI ke-n.
-func mentionStop(n int, mn analyze.Mention, line int) stop {
-	return stop{key: fmt.Sprintf("m:%d", n), path: mn.Path, isDir: mn.IsDir, size: mn.Size, line: line, parent: -1, mention: true}
+// mentionStop membuat stop untuk satu penyebutan AI; key harus unik di seluruh percakapan.
+func mentionStop(key string, mn analyze.Mention) stop {
+	return stop{key: key, path: mn.Path, isDir: mn.IsDir, size: mn.Size, parent: -1, mention: true,
+		action: mn.Action, reason: mn.Reason}
 }

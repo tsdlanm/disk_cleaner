@@ -42,6 +42,8 @@ type Item struct {
 	Path  string
 	IsDir bool
 	Size  int64
+	Files int64     // jumlah file di dalamnya (folder)
+	Mod   time.Time // perubahan terbaru: file itu, atau file terbaru di dalam folder
 }
 
 // Snapshot adalah ringkasan folder yang siap dikirim ke AI.
@@ -54,6 +56,10 @@ type Snapshot struct {
 	Lines   int          // jumlah baris di Text
 	LineIDs []int        // id item di setiap baris Text; 0 untuk baris gabungan
 	Items   map[int]Item // id -> item
+
+	// Candidates adalah item yang wajib dinilai AI, dipilih aplikasi dari yang
+	// terbesar, beserta fakta yang dihitung aplikasi.
+	Candidates []Candidate
 }
 
 // Progress berisi penghitung yang aman dibaca selama Build berjalan.
@@ -135,12 +141,16 @@ func (w *walker) walk(path, name string, keep bool) *node {
 		n.size += c.size
 		n.files += c.files
 		n.dirs += c.dirs + 1
+		if c.mod.After(n.mod) {
+			n.mod = c.mod
+		}
 		if keepChildren {
 			n.children = append(n.children, c)
 		}
 		mu.Unlock()
 	}
 	var files, bytes int64
+	var newest time.Time
 	for _, e := range entries {
 		if sizer.IsRealDir(e) {
 			child := filepath.Join(path, e.Name())
@@ -166,6 +176,9 @@ func (w *walker) walk(path, name string, keep bool) *node {
 		}
 		files++
 		bytes += fi.Size()
+		if fi.ModTime().After(newest) {
+			newest = fi.ModTime()
+		}
 		if keepChildren && fi.Size() >= w.lim.MinSize {
 			mu.Lock()
 			n.children = append(n.children, &node{
@@ -185,6 +198,9 @@ func (w *walker) walk(path, name string, keep bool) *node {
 	mu.Lock()
 	n.size += bytes
 	n.files += files
+	if newest.After(n.mod) {
+		n.mod = newest
+	}
 	mu.Unlock()
 	return n
 }
@@ -275,10 +291,12 @@ func render(root *node, lim Limits) *Snapshot {
 	}
 	var b strings.Builder
 	id := 0
+	ids := make(map[*node]int)
 	var write func(n *node, depth int)
 	write = func(n *node, depth int) {
 		id++
-		s.Items[id] = Item{ID: id, Path: n.path, IsDir: n.dir, Size: n.size}
+		ids[n] = id
+		s.Items[id] = Item{ID: id, Path: n.path, IsDir: n.dir, Size: n.size, Files: n.files, Mod: n.mod}
 		b.WriteString(strings.Repeat("  ", depth))
 		fmt.Fprintf(&b, "[%d] %s", id, n.name)
 		if n.dir {
@@ -314,5 +332,6 @@ func render(root *node, lim Limits) *Snapshot {
 	}
 	write(root, 0)
 	s.Text = b.String()
+	s.Candidates = pickCandidates(root, lim, ids, time.Now())
 	return s
 }

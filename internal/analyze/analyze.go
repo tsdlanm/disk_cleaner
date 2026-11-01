@@ -1,10 +1,12 @@
 package analyze
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -27,7 +29,8 @@ const (
 // Mention adalah item yang disebut AI di dalam jawabannya.
 type Mention struct {
 	Item
-	Action Action
+	Action Action // kosong jika AI tidak menyebut aksi (jawaban chat)
+	Reason string // alasan singkat dari AI, bila ada
 }
 
 // Result adalah hasil analisis AI.
@@ -65,40 +68,51 @@ func (r *Result) Segments() []Segment {
 }
 
 // Pengingat yang ditambahkan ke permintaan ulang.
-const (
-	retryJSON     = "\n\nPENTING: jawab HANYA dengan satu objek JSON yang sesuai format (field \"answer\" dan \"mentions\"), tanpa teks lain di luar JSON."
-	retryMentions = "\n\nPENTING: jawaban sebelumnya tidak menyebut satu pun folder atau file. Sebutkan SEMUA folder dan file yang relevan dari ringkasan di atas: di \"answer\" sebagai baris \"• [[id]] penjelasan\" di bawah judul kelompoknya, dan di \"mentions\" beserta aksi dan alasannya."
-)
+const retryJSON = "\n\nPENTING: jawab HANYA dengan satu objek JSON yang sesuai format (field \"summary\" dan \"items\"), tanpa teks lain di luar JSON."
 
-// Analyze mengirim snapshot ke provider dan membaca jawabannya. Tidak semua
-// model patuh pada format, jadi permintaan diulang sekali dengan pengingat
-// jika jawaban bukan JSON, atau jika tidak menyebut satu pun folder/file.
+// retryMissing meminta penilaian untuk item yang terlewat.
+func retryMissing(ids []int) string {
+	parts := make([]string, len(ids))
+	for i, id := range ids {
+		parts[i] = strconv.Itoa(id)
+	}
+	return "\n\nPENTING: jawaban sebelumnya belum menilai item dengan id berikut: " + strings.Join(parts, ", ") +
+		". Isi \"items\" dengan penilaian untuk SETIAP id tersebut."
+}
+
+// Analyze mengirim snapshot ke provider dan membaca jawabannya. Jawaban AI
+// berupa JSON tetap (ringkasan + penilaian per item); teks yang tampil disusun
+// aplikasi, jadi formatnya tidak bergantung pada kepatuhan model. Permintaan
+// diulang sekali jika jawaban bukan JSON, dan sekali lagi untuk item wajib
+// yang belum dinilai.
 func Analyze(ctx context.Context, p Provider, s *Snapshot) (*Result, error) {
-	raw, err := p.Complete(ctx, SystemPrompt, UserPrompt(s), resultSchema)
+	user := UserPrompt(s)
+	raw, err := p.Complete(ctx, SystemPrompt, user, resultSchema)
 	if err != nil {
 		return nil, err
 	}
-	res, err := Parse(raw, s)
-	switch {
-	case err != nil:
-		raw, err2 := p.Complete(ctx, SystemPrompt, UserPrompt(s)+retryJSON, resultSchema)
+	a, err := decode(raw)
+	if err != nil {
+		raw, err2 := p.Complete(ctx, SystemPrompt, user+retryJSON, resultSchema)
 		if err2 != nil {
 			return nil, err2
 		}
-		if res, err2 := Parse(raw, s); err2 == nil {
-			return res, nil
-		}
-		return nil, err
-	case len(res.Mentions) == 0 && len(s.Items) > 1:
-		raw, err2 := p.Complete(ctx, SystemPrompt, UserPrompt(s)+retryMentions, resultSchema)
-		if err2 != nil {
-			return res, nil // jawaban pertama tetap lebih baik daripada error
-		}
-		if res2, err2 := Parse(raw, s); err2 == nil && len(res2.Mentions) > 0 {
-			return res2, nil
+		if a, err2 = decode(raw); err2 != nil {
+			return nil, err
 		}
 	}
-	return res, nil
+	if miss := missing(s, a); len(miss) > 0 {
+		if raw, err := p.Complete(ctx, SystemPrompt, user+retryMissing(miss), resultSchema); err == nil {
+			if b, err := decode(raw); err == nil {
+				// Penilaian pertama tetap dipakai; yang kedua hanya mengisi yang kurang.
+				a.Items = append(a.Items, b.Items...)
+				if strings.TrimSpace(a.Summary) == "" {
+					a.Summary = b.Summary
+				}
+			}
+		}
+	}
+	return build(a, s), nil
 }
 
 // extractJSON mengambil objek JSON dari jawaban, termasuk jika dibungkus
@@ -112,58 +126,138 @@ func extractJSON(raw string) string {
 	return raw[start : end+1]
 }
 
-// Parse membaca jawaban JSON AI. Penanda yang merujuk id tidak dikenal
-// dibuang dari teks; item tanpa aksi yang valid dianggap "cek".
-func Parse(raw string, s *Snapshot) (*Result, error) {
-	var out struct {
-		Answer   string `json:"answer"`
-		Mentions []struct {
-			ID     int    `json:"id"`
-			Action string `json:"action"`
-			Reason string `json:"reason"`
-		} `json:"mentions"`
-	}
-	if err := json.Unmarshal([]byte(extractJSON(raw)), &out); err != nil {
+// answer adalah jawaban JSON AI.
+type answer struct {
+	Summary string `json:"summary"`
+	Items   []struct {
+		ID     int    `json:"id"`
+		Action string `json:"action"`
+		Reason string `json:"reason"`
+	} `json:"items"`
+}
+
+func decode(raw string) (*answer, error) {
+	var a answer
+	if err := json.Unmarshal([]byte(extractJSON(raw)), &a); err != nil {
 		return nil, fmt.Errorf("jawaban AI bukan JSON yang valid: %w", err)
 	}
-	actions := make(map[int]Action)
-	for _, m := range out.Mentions {
-		actions[m.ID] = validAction(Action(m.Action))
+	return &a, nil
+}
+
+// wanted adalah id yang wajib dinilai. Tanpa daftar kandidat (snapshot lama
+// atau buatan tes), semua item di ringkasan boleh dinilai.
+func (s *Snapshot) wanted() map[int]bool {
+	out := make(map[int]bool)
+	for _, c := range s.Candidates {
+		out[c.ID] = true
 	}
-
-	res := &Result{Mentions: make(map[int]Mention)}
-	res.Text = mentionRe.ReplaceAllStringFunc(out.Answer, func(tok string) string {
-		id, _ := strconv.Atoi(mentionRe.FindStringSubmatch(tok)[1])
-		item, ok := s.Items[id]
-		if !ok {
-			return ""
+	if len(out) == 0 {
+		for id := range s.Items {
+			out[id] = true
 		}
-		res.Mentions[id] = Mention{Item: item, Action: validAction(actions[id])}
-		return tok
-	})
+	}
+	return out
+}
 
-	// Sebagian model mengisi "mentions" tapi lupa menaruh penandanya di teks.
-	// Item itu ditambahkan di bawah jawaban, dikelompokkan sesuai aksinya,
-	// agar tetap bisa dipilih, dibuka, dan dihapus.
-	groups := map[Action][]string{}
-	for _, m := range out.Mentions {
-		item, ok := s.Items[m.ID]
-		if _, shown := res.Mentions[m.ID]; !ok || shown {
+// missing mengembalikan id kandidat yang belum dinilai AI, urut dari yang terbesar.
+func missing(s *Snapshot, a *answer) []int {
+	got := make(map[int]bool)
+	for _, it := range a.Items {
+		got[it.ID] = true
+	}
+	var out []int
+	for _, c := range s.Candidates {
+		if !got[c.ID] {
+			out = append(out, c.ID)
+		}
+	}
+	return out
+}
+
+// Parse membaca jawaban JSON AI tanpa meminta ulang.
+func Parse(raw string, s *Snapshot) (*Result, error) {
+	a, err := decode(raw)
+	if err != nil {
+		return nil, err
+	}
+	return build(a, s), nil
+}
+
+// noteMissing adalah alasan untuk item wajib yang tetap tidak dinilai AI.
+const noteMissing = "AI tidak memberi penilaian untuk item ini; cek sendiri."
+
+// build menyusun hasil dari jawaban AI: ringkasan, lalu kelompok "Aman
+// dihapus", "Perlu dicek dulu", dan "Sebaiknya disimpan", masing-masing dari
+// yang terbesar, satu butir "• [[id]] alasan" per item. Id yang tidak diminta
+// diabaikan; kandidat yang tidak dinilai masuk "Perlu dicek dulu".
+func build(a *answer, s *Snapshot) *Result {
+	want := s.wanted()
+	res := &Result{Mentions: make(map[int]Mention)}
+	for _, it := range a.Items {
+		item, ok := s.Items[it.ID]
+		if _, seen := res.Mentions[it.ID]; !ok || seen || !want[it.ID] {
 			continue
 		}
-		a := validAction(Action(m.Action))
-		res.Mentions[m.ID] = Mention{Item: item, Action: a}
-		groups[a] = append(groups[a], strings.TrimSpace(fmt.Sprintf("• [[%d]] %s", m.ID, m.Reason)))
+		res.Mentions[it.ID] = Mention{Item: item, Action: validAction(Action(strings.ToLower(strings.TrimSpace(it.Action)))), Reason: clean(it.Reason)}
 	}
+	for _, c := range s.Candidates {
+		if _, ok := res.Mentions[c.ID]; !ok {
+			res.Mentions[c.ID] = Mention{Item: s.Items[c.ID], Action: ActionReview, Reason: noteMissing}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(clean(a.Summary))
 	for _, g := range []struct {
 		a     Action
 		title string
 	}{{ActionDelete, "Aman dihapus:"}, {ActionReview, "Perlu dicek dulu:"}, {ActionKeep, "Sebaiknya disimpan:"}} {
-		if len(groups[g.a]) > 0 {
-			res.Text = strings.TrimRight(res.Text, "\n") + "\n\n" + g.title + "\n" + strings.Join(groups[g.a], "\n")
+		var group []Mention
+		for _, mn := range res.Mentions {
+			if mn.Action == g.a {
+				group = append(group, mn)
+			}
+		}
+		if len(group) == 0 {
+			continue
+		}
+		slices.SortFunc(group, func(x, y Mention) int {
+			if c := cmp.Compare(y.Size, x.Size); c != 0 {
+				return c
+			}
+			return cmp.Compare(x.ID, y.ID)
+		})
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(g.title)
+		for _, mn := range group {
+			fmt.Fprintf(&b, "\n• [[%d]] %s", mn.ID, mn.Reason)
 		}
 	}
-	return res, nil
+	res.Text = strings.TrimRight(b.String(), " ")
+	return res
+}
+
+// clean merapikan teks dari AI menjadi satu baris tanpa penanda [[id]].
+func clean(s string) string {
+	s = strings.Join(strings.Fields(chatMentionRe.ReplaceAllString(s, "")), " ")
+	return strings.NewReplacer(" .", ".", " ,", ",", " ;", ";").Replace(s)
+}
+
+var (
+	headingRe = regexp.MustCompile(`[ \t]*\n*[ \t]*(Aman dihapus|Perlu dicek dulu|Sebaiknya disimpan):[ \t]*\n*`)
+	bulletRe  = regexp.MustCompile(`([^\n \t])[ \t]*•[ \t]*`)
+)
+
+// tidyAnswer memulihkan baris baru yang hilang: sebagian model menulis seluruh
+// jawaban sebagai satu paragraf ("… Aman dihapus: • a • b Perlu dicek dulu: …").
+// Judul kelompok dipisah baris kosong dan tiap butir "•" mulai di baris baru.
+// Jawaban yang sudah rapi tidak berubah.
+func tidyAnswer(s string) string {
+	s = headingRe.ReplaceAllString(s, "\n\n$1:\n")
+	s = bulletRe.ReplaceAllString(s, "$1\n• ")
+	return strings.TrimLeft(s, "\n")
 }
 
 // validAction mengembalikan a jika dikenal; aksi lain dianggap "cek".

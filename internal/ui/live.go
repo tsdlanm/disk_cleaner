@@ -76,9 +76,11 @@ func (m *model) waitLive() tea.Cmd {
 		if !ok {
 			return nil
 		}
-		dirs := make(map[string]bool)
+		// Folder yang berubah memakai ejaan panjang, sama dengan path folder
+		// yang dibuka di explorer.
+		norm, dirs := recent.NewNormalizer(), make(map[string]bool)
 		for _, p := range b.Paths {
-			dirs[filepath.Dir(p)] = true
+			dirs[filepath.Dir(norm.Path(p))] = true
 		}
 		return liveMsg{changes: recent.Check(b.Paths, opt, time.Now()), dirs: dirs, lost: b.Lost}
 	}

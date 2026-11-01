@@ -118,6 +118,19 @@ func (s *Sizer) Put(path string, inf Info) {
 	s.mu.Unlock()
 }
 
+// Measure menghitung ukuran path sekarang juga (memblok), memakai dan mengisi
+// cache. Untuk pemakai yang butuh angka langsung, misalnya alat baca-saja
+// milik chat AI.
+func (s *Sizer) Measure(path string) Info {
+	if inf, st := s.Get(path); st == Done {
+		return inf
+	}
+	s.mu.RLock()
+	gen := s.gen
+	s.mu.RUnlock()
+	return s.walk(path, gen, new(atomic.Int64))
+}
+
 // Pending mengembalikan jumlah job yang menunggu atau sedang berjalan.
 func (s *Sizer) Pending() int {
 	s.qmu.Lock()

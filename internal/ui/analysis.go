@@ -8,12 +8,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
-	"github.com/mattn/go-runewidth"
 
 	"github.com/tsdlanm/cli_app/internal/analyze"
 	"github.com/tsdlanm/cli_app/internal/format"
@@ -22,13 +21,54 @@ import (
 type anPhase int
 
 const (
-	anCollect anPhase = iota // memindai folder
-	anWaiting                // menunggu jawaban AI
+	anCollect anPhase = iota // memindai folder (lokal, tanpa AI)
+	anConfirm                // data siap; menunggu pengguna setuju mengirim ke AI
+	anWaiting                // menunggu jawaban analisis pertama
 	anDone
 	anFailed
 )
 
-// analysis adalah satu analisis AI beserta layar hasilnya.
+// entryKind adalah jenis satu entri di percakapan.
+type entryKind int
+
+const (
+	entUser   entryKind = iota // pertanyaan pengguna
+	entTool                    // langkah alat yang dijalankan AI
+	entAnswer                  // jawaban AI, dengan penyebutan item
+	entError
+	entNote // catatan dari aplikasi (bantuan, pertanyaan dibatalkan)
+)
+
+// entry adalah satu entri di percakapan.
+type entry struct {
+	kind entryKind
+	text string          // pertanyaan, label alat, atau pesan
+	sum  string          // alat: hasil singkat
+	done bool            // alat: sudah selesai
+	res  *analyze.Result // jawaban
+}
+
+// stepFeed menampung langkah alat dari goroutine AI untuk dibaca layar.
+type stepFeed struct {
+	mu    sync.Mutex
+	steps []analyze.Step
+}
+
+func (f *stepFeed) push(s analyze.Step) {
+	f.mu.Lock()
+	f.steps = append(f.steps, s)
+	f.mu.Unlock()
+}
+
+func (f *stepFeed) drain() []analyze.Step {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.steps
+	f.steps = nil
+	return out
+}
+
+// analysis adalah satu analisis AI beserta percakapan lanjutannya.
 type analysis struct {
 	id       int
 	root     string
@@ -39,20 +79,35 @@ type analysis struct {
 	provider analyze.Provider
 	prog     *analyze.Progress
 	snap     *analyze.Snapshot
-	res      *analyze.Result
+	res      *analyze.Result // jawaban analisis pertama
 	err      error
 	start    time.Time
 	elapsed  time.Duration
 
-	// Kursor di jawaban: indeks ke daftar stop hasil layoutAnswer. curKey
-	// menjaga kursor tetap di item yang sama saat isi folder dibuka/ditutup.
-	cursor     int
-	curKey     string
+	// Percakapan.
+	entries   []entry
+	sess      *analyze.Session
+	input     []rune
+	hist      [][]rune // pertanyaan sebelumnya; ↑ ↓ di kotak ketik
+	histPos   int
+	busy      bool // menunggu jawaban pertanyaan lanjutan
+	qSeq      int  // nomor pertanyaan; jawaban dari pertanyaan lama diabaikan
+	qStart    time.Time
+	qCancel   context.CancelFunc
+	cancelled bool // pembatalan sudah diminta
+	feed      *stepFeed
+	toolRow   map[int]int // nomor langkah -> indeks entri alat
+
+	// Tampilan.
+	itemsFocus bool                  // fokus di item yang disebut, bukan di kotak ketik
+	cursor     int                   // indeks ke stop
+	curKey     string                // menjaga kursor di item yang sama saat tampilan berubah
 	lastW      int                   // lebar teks terakhir, untuk menyusun stop saat tombol ditekan
 	exp        map[string]*expansion // folder yang dibuka di dalam jawaban
 	dataCursor int                   // posisi kursor di tampilan data (indeks dataStops)
 	textOff    int                   // baris teratas yang terlihat
 	free       bool                  // pengguna menggulir sendiri; jangan paksa kursor terlihat
+	stick      bool                  // ikuti ujung bawah percakapan
 	showData   bool                  // tampilkan data yang dikirim ke AI
 	marks      map[string]bool
 	markItems  map[string]delItem // detail item yang ditandai, untuk konfirmasi hapus
@@ -70,20 +125,17 @@ type (
 		res *analyze.Result
 		err error
 	}
+	// chatMsg adalah jawaban pertanyaan lanjutan nomor q.
+	chatMsg struct {
+		id, q int
+		res   *analyze.Result
+		err   error
+	}
 	anTickMsg struct{ id int }
 )
 
-const (
-	keysAnalysis = "↑↓ pindah · enter buka/tutup folder · ← ke induk · e ke explorer · space tandai · d hapus · o Explorer · pgup/pgdn gulir · v data folder · r ulang · p pengaturan AI · esc kembali"
-	keysData     = "↑↓ pilih item · enter/e buka di explorer · space tandai · d hapus · o Explorer · v kembali ke jawaban · r ulang · p pengaturan AI · esc kembali"
-)
-
-var (
-	chipDelete = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Underline(true)
-	chipReview = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Underline(true)
-	chipKeep   = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Underline(true)
-	chipSel    = lipgloss.NewStyle().Reverse(true).Bold(true)
-)
+// maxInput membatasi panjang pertanyaan.
+const maxInput = 2000
 
 func anTick(id int) tea.Cmd {
 	return tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return anTickMsg{id: id} })
@@ -116,7 +168,9 @@ func (m *model) requestAnalysis() tea.Cmd {
 	return m.analyzePath(root)
 }
 
-// analyzePath memulai analisis root, atau meminta API key lebih dulu.
+// analyzePath memulai analisis baru untuk root; analisis sebelumnya tidak
+// disimpan. Folder dipindai lebih dulu secara lokal dan baru dikirim ke AI
+// setelah pengguna setuju. Tanpa API key, Pengaturan AI dibuka lebih dulu.
 func (m *model) analyzePath(root string) tea.Cmd {
 	if m.cfg.NeedsKey() {
 		m.openSettings(root, true)
@@ -125,21 +179,25 @@ func (m *model) analyzePath(root string) tea.Cmd {
 	return m.startAnalysis(root)
 }
 
+// sameDir membandingkan dua path folder tanpa membedakan huruf besar/kecil.
+func sameDir(a, b string) bool {
+	return strings.EqualFold(strings.TrimRight(filepath.Clean(a), `\`), strings.TrimRight(filepath.Clean(b), `\`))
+}
+
 func (m *model) startAnalysis(root string) tea.Cmd {
 	p, err := m.newProvider(m.cfg)
 	if err != nil {
 		m.status = "AI belum siap: " + err.Error()
 		return nil
 	}
-	if m.lastAn != nil && m.lastAn.cancel != nil {
-		m.lastAn.cancel()
-	}
+	m.closeAnalysis()
 	ctx, cancel := context.WithCancel(context.Background())
-	model := m.cfg.ModelName()
 	m.anSeq++
 	an := &analysis{
-		id: m.anSeq, root: root, model: model, phase: anCollect,
+		id: m.anSeq, root: root, model: m.cfg.ModelName(), phase: anCollect,
 		ctx: ctx, cancel: cancel, provider: p, prog: &analyze.Progress{}, start: time.Now(),
+		entries: []entry{{kind: entUser, text: "Analisis " + truncateLeft(root, 70)}}, stick: true,
+		feed: &stepFeed{}, toolRow: make(map[int]int),
 		exp: make(map[string]*expansion), marks: make(map[string]bool),
 		markItems: make(map[string]delItem), gone: make(map[string]bool),
 	}
@@ -152,6 +210,46 @@ func (m *model) startAnalysis(root string) tea.Cmd {
 	return tea.Batch(build, anTick(an.id))
 }
 
+// closeAnalysis membatalkan pekerjaan analisis yang berjalan dan membuangnya;
+// percakapan tidak disimpan.
+func (m *model) closeAnalysis() {
+	if an := m.lastAn; an != nil {
+		an.cancel()
+		if an.qCancel != nil {
+			an.qCancel()
+		}
+	}
+	m.an, m.lastAn = nil, nil
+}
+
+// confirmNote adalah catatan di layar konfirmasi: apa yang sudah dipindai dan
+// apa yang akan dikirim ke AI jika pengguna setuju.
+func (an *analysis) confirmNote() string {
+	s := an.snap
+	return fmt.Sprintf("Folder selesai dipindai di komputer ini: %s file · %s. Belum ada yang dikirim ke AI.\n"+
+		"Jika dikirim ke %s: %s item terbesar dinilai satu per satu (hapus / cek / simpan) dari %s baris data "+
+		"(perkiraan %s token), hanya nama, ukuran, dan tanggal, tidak pernah isi file.\n"+
+		"enter kirim · v lihat data yang akan dikirim · esc batal",
+		format.Int(s.Files), format.Bytes(s.Size), an.model, format.Int(int64(len(s.Candidates))),
+		format.Int(int64(s.Lines)), format.Int(int64(len(analyze.UserPrompt(s))/3)))
+}
+
+// sendAnalysis mengirim data folder ke AI setelah pengguna setuju.
+func (m *model) sendAnalysis(an *analysis) tea.Cmd {
+	an.phase, an.start = anWaiting, time.Now()
+	an.stick, an.free = true, false
+	if n := len(an.entries); n > 0 && an.entries[n-1].kind == entNote {
+		an.entries = an.entries[:n-1] // catatan konfirmasi sudah terjawab
+	}
+	ctx, p, s, id := an.ctx, an.provider, an.snap, an.id
+	run := func() tea.Msg {
+		res, err := analyze.Analyze(ctx, p, s)
+		return aiMsg{id: id, res: res, err: err}
+	}
+	return tea.Batch(run, anTick(id))
+}
+
+// fail mengakhiri analisis dengan error, lengkap dengan petunjuk langkah berikutnya.
 func (an *analysis) fail(err error) {
 	an.phase, an.elapsed = anFailed, time.Since(an.start)
 	if errors.Is(err, context.Canceled) {
@@ -159,6 +257,17 @@ func (an *analysis) fail(err error) {
 	}
 	an.err = err
 	an.cancel()
+	hint := "Ketik /ulang untuk mencoba lagi."
+	if errors.Is(err, analyze.ErrInvalidKey) {
+		hint = "API key ditolak. Ketik /model untuk mengganti API key, model, atau provider, lalu /ulang."
+	}
+	if an.snap != nil {
+		hint += " Data folder tetap bisa dilihat dengan /data."
+	}
+	an.entries = append(an.entries,
+		entry{kind: entError, text: "Gagal: " + err.Error()},
+		entry{kind: entNote, text: hint})
+	an.stick, an.free = true, false
 }
 
 func (m *model) updateAnalysis(msg tea.Msg) tea.Cmd {
@@ -172,12 +281,10 @@ func (m *model) updateAnalysis(msg tea.Msg) tea.Cmd {
 			an.fail(msg.err)
 			return nil
 		}
-		an.snap, an.phase = msg.snap, anWaiting
-		ctx, p, s, id := an.ctx, an.provider, msg.snap, an.id
-		return func() tea.Msg {
-			res, err := analyze.Analyze(ctx, p, s)
-			return aiMsg{id: id, res: res, err: err}
-		}
+		an.snap, an.phase = msg.snap, anConfirm
+		an.entries = append(an.entries, entry{kind: entNote, text: an.confirmNote()})
+		an.stick, an.free = true, false
+		return nil
 
 	case aiMsg:
 		if an == nil || an.id != msg.id || an.phase != anWaiting {
@@ -187,19 +294,88 @@ func (m *model) updateAnalysis(msg tea.Msg) tea.Cmd {
 			an.fail(msg.err)
 		} else {
 			an.res, an.phase, an.elapsed = msg.res, anDone, time.Since(an.start)
-			an.cursor, an.curKey = 0, "m:0"
+			an.entries = append(an.entries, entry{kind: entAnswer, res: msg.res})
+			an.sess = analyze.NewSession(an.snap, msg.res, m.sz.Measure)
+			an.cursor, an.curKey = 0, "m:1:0"
+			// Hasil dibaca dari atas: ringkasan dulu, bukan ujung bawah daftar.
+			an.textOff, an.stick, an.free = 0, false, true
 			an.cancel()
 		}
-		if m.an == nil {
-			m.status = "Analisis AI selesai, tekan b untuk melihat hasilnya"
+
+	case chatMsg:
+		if an == nil || an.id != msg.id || msg.q != an.qSeq || !an.busy {
+			return nil
 		}
+		m.drainSteps(an)
+		an.busy, an.cancelled = false, false
+		an.qCancel()
+		switch {
+		case errors.Is(msg.err, context.Canceled):
+			an.entries = append(an.entries, entry{kind: entNote, text: "Pertanyaan dibatalkan."})
+		case msg.err != nil:
+			an.entries = append(an.entries, entry{kind: entError, text: "Gagal: " + msg.err.Error()})
+			if errors.Is(msg.err, analyze.ErrInvalidKey) {
+				an.entries = append(an.entries, entry{kind: entNote, text: "API key ditolak. Ketik /model untuk menggantinya."})
+			}
+		default:
+			an.entries = append(an.entries, entry{kind: entAnswer, res: msg.res})
+		}
+		an.stick, an.free = true, false
 
 	case anTickMsg:
-		if an != nil && an.id == msg.id && (an.phase == anCollect || an.phase == anWaiting) {
-			return anTick(an.id)
+		if an != nil && an.id == msg.id {
+			m.drainSteps(an)
+			if an.phase == anCollect || an.phase == anWaiting || an.busy {
+				return anTick(an.id)
+			}
 		}
 	}
 	return nil
+}
+
+// drainSteps memasukkan langkah alat yang baru jalan ke percakapan.
+func (m *model) drainSteps(an *analysis) {
+	for _, s := range an.feed.drain() {
+		i, ok := an.toolRow[s.N]
+		if !ok {
+			i = len(an.entries)
+			an.entries = append(an.entries, entry{kind: entTool})
+			an.toolRow[s.N] = i
+		}
+		an.entries[i].text, an.entries[i].sum, an.entries[i].done = s.Label, s.Summary, s.Done
+		an.stick = an.stick || !an.free
+	}
+}
+
+// ask mengirim pertanyaan lanjutan. AI bisa memanggil alat baca-saja sebelum
+// menjawab; langkahnya tampil di percakapan.
+func (m *model) ask(an *analysis, question string) tea.Cmd {
+	p, err := m.newProvider(m.cfg)
+	if err != nil {
+		an.entries = append(an.entries, entry{kind: entError, text: "AI belum siap: " + err.Error()})
+		return nil
+	}
+	chat, ok := p.(analyze.Chatter)
+	if !ok {
+		an.entries = append(an.entries, entry{kind: entError, text: "Provider ini belum mendukung chat."})
+		return nil
+	}
+	an.entries = append(an.entries, entry{kind: entUser, text: question})
+	an.hist = append(an.hist, []rune(question))
+	an.histPos = len(an.hist)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	an.qSeq++
+	an.busy, an.cancelled, an.qStart, an.qCancel = true, false, time.Now(), cancel
+	an.toolRow = make(map[int]int)
+	an.stick, an.free, an.itemsFocus = true, false, false
+
+	sess, feed, id, q := an.sess, an.feed, an.id, an.qSeq
+	run := func() tea.Msg {
+		res, err := sess.Ask(ctx, chat, question, feed.push)
+		return chatMsg{id: id, q: q, res: res, err: err}
+	}
+	return tea.Batch(run, anTick(id))
 }
 
 // dataStops mengembalikan nomor baris data yang berisi item (bisa dipilih).
@@ -216,17 +392,13 @@ func (an *analysis) dataStops() []int {
 	return out
 }
 
-// answerStops menyusun ulang posisi kursor di jawaban AI dan menyelaraskan
-// kursor dengan item yang sebelumnya dipilih.
-func (m *model) answerStops(an *analysis) []stop {
-	if an.res == nil {
-		return nil
-	}
+// transcriptStops menyusun posisi kursor di seluruh percakapan.
+func (m *model) transcriptStops(an *analysis) []stop {
 	w := an.lastW
 	if w == 0 {
 		w = max(m.screenWidth()-2, 20)
 	}
-	_, stops := m.layoutAnswer(an, w)
+	_, stops := m.layoutTranscript(an, w)
 	return stops
 }
 
@@ -251,8 +423,8 @@ func (an *analysis) moveTo(stops []stop, i int) {
 	an.cursor, an.curKey, an.free = i, stops[i].key, false
 }
 
-// current mengembalikan item di posisi kursor, baik di jawaban AI maupun
-// di tampilan data.
+// current mengembalikan item di posisi kursor, baik di percakapan maupun di
+// tampilan data.
 func (m *model) current(an *analysis) (stop, []stop, bool) {
 	if an.showData {
 		lines := an.dataStops()
@@ -263,98 +435,219 @@ func (m *model) current(an *analysis) (stop, []stop, bool) {
 		it := an.snap.Items[an.snap.LineIDs[lines[an.dataCursor]]]
 		return stop{path: it.Path, isDir: it.IsDir, size: it.Size}, nil, true
 	}
-	stops := m.answerStops(an)
+	stops := m.transcriptStops(an)
 	if len(stops) == 0 {
 		return stop{}, nil, false
 	}
+	an.syncCursor(stops)
 	return stops[an.cursor], stops, true
 }
 
-func (m *model) handleAnalysisKey(key string) tea.Cmd {
+// handleAnalysisKey menangani tombol di layar analisis. Default-nya mengetik
+// di kotak pertanyaan; Tab berpindah ke item yang disebut AI.
+func (m *model) handleAnalysisKey(msg tea.KeyMsg) tea.Cmd {
 	an := m.an
-	page := max(m.listHeight()-1, 1)
-	switch key {
-	case "ctrl+c":
+	m.status = ""
+	if msg.Type == tea.KeyCtrlC {
 		return tea.Quit
-	case "q", "esc":
-		if an.phase == anCollect || an.phase == anWaiting {
-			an.fail(context.Canceled)
+	}
+	switch {
+	case an.showData:
+		return m.handleDataKey(an, msg.String())
+	case an.phase == anConfirm:
+		switch msg.String() {
+		case "enter":
+			return m.sendAnalysis(an)
+		case "v":
+			an.showData, an.textOff, an.free = true, 0, false
+		case "esc", "q":
+			m.closeAnalysis()
+		case "pgup":
+			m.scroll(an, -1)
+		case "pgdown":
+			m.scroll(an, 1)
 		}
-		m.an = nil
 		return nil
-	case "r":
+	case an.phase == anCollect || an.phase == anWaiting:
+		switch msg.String() {
+		case "esc", "q":
+			m.closeAnalysis()
+		case "pgup":
+			m.scroll(an, -1)
+		case "pgdown":
+			m.scroll(an, 1)
+		}
+		return nil
+	case an.itemsFocus:
+		return m.handleItemsKey(an, msg.String())
+	}
+	return m.handleInputKey(an, msg)
+}
+
+// scroll menggulir percakapan satu halaman ke atas (dir < 0) atau ke bawah.
+func (m *model) scroll(an *analysis, dir int) {
+	page := max(m.chatHeight()-1, 1)
+	an.textOff += dir * page
+	an.free = true
+	an.stick = false
+}
+
+func (m *model) handleInputKey(an *analysis, msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyEsc:
+		switch {
+		case an.busy:
+			if !an.cancelled {
+				an.cancelled = true
+				an.qCancel()
+				m.status = "Membatalkan pertanyaan…"
+			}
+		case len(an.input) > 0:
+			an.input, an.histPos = nil, len(an.hist)
+		default:
+			m.closeAnalysis() // percakapan tidak disimpan
+		}
+	case tea.KeyEnter:
+		text := strings.TrimSpace(string(an.input))
+		if an.busy || text == "" {
+			return nil
+		}
+		an.input, an.histPos = nil, len(an.hist)
+		if strings.HasPrefix(text, "/") {
+			return m.runCommand(an, text)
+		}
+		if an.phase != anDone || an.sess == nil {
+			m.status = "Chat tersedia setelah analisis berhasil"
+			return nil
+		}
+		return m.ask(an, text)
+	case tea.KeyTab:
+		if stops := m.transcriptStops(an); len(stops) > 0 && !an.busy {
+			an.itemsFocus = true
+			an.syncCursor(stops)
+			// Pilih item yang sedang terlihat, supaya layar tidak melompat.
+			if l := stops[an.cursor].line; l < an.textOff || l >= an.textOff+m.chatHeight() {
+				for i, s := range stops {
+					if s.line >= an.textOff {
+						an.cursor = i
+						break
+					}
+				}
+			}
+			an.moveTo(stops, an.cursor)
+		} else {
+			m.status = "Belum ada item yang disebut AI"
+		}
+	case tea.KeyUp:
+		if an.histPos > 0 && len(an.hist) > 0 {
+			an.histPos--
+			an.input = slices.Clone(an.hist[an.histPos])
+		}
+	case tea.KeyDown:
+		if an.histPos < len(an.hist) {
+			an.histPos++
+			an.input = nil
+			if an.histPos < len(an.hist) {
+				an.input = slices.Clone(an.hist[an.histPos])
+			}
+		}
+	case tea.KeyPgUp:
+		m.scroll(an, -1)
+	case tea.KeyPgDown:
+		m.scroll(an, 1)
+	case tea.KeyBackspace:
+		if !an.busy && len(an.input) > 0 {
+			an.input = an.input[:len(an.input)-1]
+		}
+	case tea.KeyCtrlU:
+		if !an.busy {
+			an.input = nil
+		}
+	case tea.KeyRunes, tea.KeySpace:
+		if an.busy {
+			return nil
+		}
+		// Karakter kontrol (baris baru dari paste, NUL) tidak ikut masuk.
+		for _, r := range msg.Runes {
+			if !unicode.IsControl(r) && len(an.input) < maxInput {
+				an.input = append(an.input, r)
+			}
+		}
+		an.stick, an.free = true, false
+	}
+	return nil
+}
+
+// anCommands adalah perintah yang diketik di kotak pertanyaan.
+var anCommands = []struct{ name, desc string }{
+	{"/data", "lihat data folder yang dikirim ke AI (item bisa dipilih)"},
+	{"/ulang", "pindai ulang folder ini, lalu tanya lagi sebelum dikirim"},
+	{"/bersih", "hapus pertanyaan lanjutan, kembali ke analisis awal"},
+	{"/model", "ganti provider, model, atau API key"},
+	{"/bantuan", "daftar perintah dan tombol"},
+}
+
+func (m *model) runCommand(an *analysis, text string) tea.Cmd {
+	switch strings.Fields(text)[0] {
+	case "/data":
+		if an.snap == nil {
+			m.status = "Data folder belum tersedia"
+			return nil
+		}
+		an.showData, an.textOff, an.free = true, 0, false
+	case "/ulang":
 		return m.startAnalysis(an.root)
-	case "p":
-		m.openSettings("", false)
-		return nil
-	case "v":
-		if an.snap != nil {
-			an.showData = !an.showData
-			an.textOff, an.free = 0, false
+	case "/bersih":
+		if an.sess == nil {
+			m.status = "Belum ada percakapan"
+			return nil
 		}
+		an.sess.Reset()
+		an.entries = an.entries[:min(len(an.entries), 2)]
+		an.toolRow = make(map[int]int)
+		an.hist, an.histPos = nil, 0
+		an.stick, an.free = true, false
+		an.syncCursor(m.transcriptStops(an))
+	case "/model", "/pengaturan":
+		m.openSettings("", false)
+	case "/bantuan":
+		var b strings.Builder
+		b.WriteString("Ketik pertanyaan lalu Enter. AI bisa melihat isi folder dan mencari file (baca-saja) bila perlu.\n")
+		for _, c := range anCommands {
+			fmt.Fprintf(&b, "%-9s %s\n", c.name, c.desc)
+		}
+		b.WriteString("Tab pindah ke item yang disebut AI: Enter buka folder, Space tandai, d hapus, e explorer.")
+		an.entries = append(an.entries, entry{kind: entNote, text: b.String()})
+		an.stick, an.free = true, false
+	default:
+		m.status = "Perintah tidak dikenal: " + strings.Fields(text)[0] + " · ketik /bantuan"
+	}
+	return nil
+}
+
+// handleItemsKey menangani tombol saat fokus di item yang disebut AI.
+func (m *model) handleItemsKey(an *analysis, k string) tea.Cmd {
+	switch k {
+	case "esc", "tab":
+		an.itemsFocus, an.stick, an.free = false, true, false
 		return nil
 	case "pgup":
-		an.textOff, an.free = an.textOff-page, true
+		m.scroll(an, -1)
 		return nil
 	case "pgdown":
-		an.textOff, an.free = an.textOff+page, true
+		m.scroll(an, 1)
 		return nil
 	}
-
 	cur, stops, ok := m.current(an)
 	if !ok {
+		an.itemsFocus = false
 		return nil
 	}
-
-	// Aksi yang sama di jawaban AI maupun di tampilan data.
-	switch key {
-	case " ", "space":
-		if !an.gone[cur.path] {
-			if an.marks[cur.path] {
-				delete(an.marks, cur.path)
-				delete(an.markItems, cur.path)
-			} else {
-				an.marks[cur.path] = true
-				an.markItems[cur.path] = an.delItem(cur)
-			}
-		}
-		return m.step(an, stops, 1, false)
-	case "d", "delete":
-		var items []delItem
-		for _, p := range slices.Sorted(maps.Keys(an.markItems)) {
-			if !an.gone[p] {
-				items = append(items, an.markItems[p])
-			}
-		}
-		if len(items) == 0 && !an.gone[cur.path] {
-			items = append(items, an.delItem(cur))
-		}
-		m.popup = m.confirmDelete(items)
-		return nil
-	case "o":
-		m.status = explorerSelect(cur.path)
-		return nil
-	case "e":
-		return m.gotoExplorer(cur)
-	case "down", "j", "tab":
-		return m.step(an, stops, 1, true)
-	case "up", "k", "shift+tab":
-		return m.step(an, stops, -1, true)
-	case "home", "g":
-		return m.step(an, stops, -1<<30, false)
-	case "end", "G":
-		return m.step(an, stops, 1<<30, false)
+	if cmd, done := m.itemAction(an, cur, stops, k); done {
+		return cmd
 	}
 
-	if an.showData {
-		if key == "enter" || key == "right" || key == "l" {
-			return m.gotoExplorer(cur)
-		}
-		return nil
-	}
-
-	// Khusus jawaban AI: buka/tutup folder di dalam chat.
-	switch key {
+	switch k {
 	case "enter", "right", "l":
 		switch {
 		case an.gone[cur.path]:
@@ -373,6 +666,76 @@ func (m *model) handleAnalysisKey(key string) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+// handleDataKey menangani tombol di tampilan data folder.
+func (m *model) handleDataKey(an *analysis, k string) tea.Cmd {
+	switch k {
+	case "esc", "q", "v":
+		an.showData, an.textOff, an.free, an.stick = false, 0, false, true
+		return nil
+	case "pgup":
+		m.scroll(an, -1)
+		return nil
+	case "pgdown":
+		m.scroll(an, 1)
+		return nil
+	}
+	cur, stops, ok := m.current(an)
+	if !ok {
+		return nil
+	}
+	if cmd, done := m.itemAction(an, cur, stops, k); done {
+		return cmd
+	}
+	if k == "enter" || k == "right" || k == "l" {
+		return m.gotoExplorer(cur)
+	}
+	return nil
+}
+
+// itemAction menjalankan aksi yang sama untuk item di percakapan maupun di
+// tampilan data: tandai, hapus, buka di Explorer, pindah kursor.
+func (m *model) itemAction(an *analysis, cur stop, stops []stop, k string) (tea.Cmd, bool) {
+	switch k {
+	case " ", "space":
+		if !an.gone[cur.path] {
+			if an.marks[cur.path] {
+				delete(an.marks, cur.path)
+				delete(an.markItems, cur.path)
+			} else {
+				an.marks[cur.path] = true
+				an.markItems[cur.path] = an.delItem(cur)
+			}
+		}
+		return m.step(an, stops, 1, false), true
+	case "d", "delete":
+		var items []delItem
+		for _, p := range slices.Sorted(maps.Keys(an.markItems)) {
+			if !an.gone[p] {
+				items = append(items, an.markItems[p])
+			}
+		}
+		if len(items) == 0 && !an.gone[cur.path] {
+			items = append(items, an.delItem(cur))
+		}
+		m.popup = m.confirmDelete(items)
+		return nil, true
+	case "o":
+		m.status = explorerSelect(cur.path)
+		return nil, true
+	case "e":
+		return m.gotoExplorer(cur), true
+	case "down", "j":
+		return m.step(an, stops, 1, true), true
+	case "up", "k", "shift+tab":
+		return m.step(an, stops, -1, true), true
+	case "home", "g":
+		return m.step(an, stops, -1<<30, false), true
+	case "end", "G":
+		return m.step(an, stops, 1<<30, false), true
+	}
+	return nil, false
 }
 
 // step menggeser kursor sebanyak d. wrap true membuat kursor berputar dari
@@ -404,13 +767,13 @@ func (an *analysis) delItem(s stop) delItem {
 }
 
 // gotoExplorer membuka item di explorer utama: folder dibuka, file dipilih
-// di folder induknya. Tekan b untuk kembali ke hasil analisis.
+// di folder induknya. Analisisnya ditutup (tidak disimpan).
 func (m *model) gotoExplorer(s stop) tea.Cmd {
 	if m.an.gone[s.path] {
 		m.status = "Item ini sudah dihapus"
 		return nil
 	}
-	m.an = nil
+	m.closeAnalysis()
 	dir, sel := s.path, ""
 	if !s.isDir {
 		dir, sel = filepath.Dir(s.path), filepath.Base(s.path)
@@ -434,229 +797,6 @@ func (an *analysis) rel(path string) string {
 	return r
 }
 
-// chip menyusun tampilan satu penyebutan item: [path · ukuran], berwarna
-// sesuai saran AI, dengan ▸/▾ untuk folder. Mengembalikan teks berwarna dan
-// lebar tampilnya.
-func (an *analysis) chip(mn analyze.Mention, selected bool, maxW int) (string, int) {
-	name := an.rel(mn.Path)
-	marker := ""
-	if mn.IsDir {
-		name += string(filepath.Separator)
-		marker = "▸ "
-		if an.exp[mn.Path] != nil {
-			marker = "▾ "
-		}
-	}
-	tail := " · " + format.Bytes(mn.Size)
-	if an.gone[mn.Path] {
-		tail = " · terhapus"
-	}
-	prefix := "["
-	if an.marks[mn.Path] {
-		prefix = "[✓ "
-	}
-	if room := maxW - runewidth.StringWidth(marker+prefix+tail+"]"); runewidth.StringWidth(name) > room {
-		name = truncateLeft(name, max(room, 8))
-	}
-	plain := prefix + name + tail + "]"
-
-	var style lipgloss.Style
-	switch {
-	case selected:
-		style = chipSel
-	case an.gone[mn.Path]:
-		style = dimStyle
-	case mn.Action == analyze.ActionDelete:
-		style = chipDelete
-	case mn.Action == analyze.ActionKeep:
-		style = chipKeep
-	default:
-		style = chipReview
-	}
-	return dimStyle.Render(marker) + style.Render(plain), runewidth.StringWidth(marker + plain)
-}
-
-// layoutAnswer membungkus jawaban AI ke lebar w. Penyebutan item tidak
-// dipotong di tengah, baris "• …" yang terbungkus menjorok ke dalam, dan isi
-// folder yang dibuka tampil sebagai tree di bawah paragrafnya. stops berisi
-// setiap posisi kursor sesuai urutan tampil.
-func (m *model) layoutAnswer(an *analysis, w int) (lines []string, stops []stop) {
-	var cur strings.Builder
-	curW, lineStart, hang := 0, 0, 0
-	pendingSpace, paraStart := false, true
-	var opened []int // stop folder terbuka di paragraf ini; tree-nya ditulis di akhir paragraf
-	nth := 0
-
-	newLine := func(indent int) {
-		lines = append(lines, cur.String())
-		cur.Reset()
-		cur.WriteString(strings.Repeat(" ", indent))
-		curW, lineStart = indent, indent
-	}
-	place := func(text string, width int) {
-		space := 0
-		if pendingSpace && curW > lineStart {
-			space = 1
-		}
-		if curW > lineStart && curW+space+width > w {
-			newLine(hang)
-			space = 0
-		}
-		if space == 1 {
-			cur.WriteString(" ")
-		}
-		cur.WriteString(text)
-		curW += space + width
-		pendingSpace = false
-	}
-	// endParagraph menutup baris saat ini lalu menulis tree folder yang
-	// dibuka di paragraf ini, tepat di bawahnya.
-	endParagraph := func() {
-		newLine(0)
-		for _, i := range opened {
-			m.emitTree(an, &lines, &stops, i, stops[i].path, "    ", w)
-		}
-		opened = opened[:0]
-		hang, pendingSpace, paraStart = 0, false, true
-	}
-
-	for _, sg := range an.res.Segments() {
-		if sg.ID > 0 {
-			mn, ok := an.res.Mentions[sg.ID]
-			if !ok {
-				continue
-			}
-			s := mentionStop(nth, mn, 0)
-			nth++
-			text, width := an.chip(mn, s.key == an.curKey, w-hang)
-			place(text, width)
-			s.line = len(lines)
-			stops = append(stops, s)
-			if mn.IsDir && an.exp[mn.Path] != nil {
-				opened = append(opened, len(stops)-1)
-			}
-			paraStart = false
-			continue
-		}
-		for i, part := range strings.Split(sg.Text, "\n") {
-			if i > 0 {
-				endParagraph()
-			}
-			for j, word := range strings.Split(part, " ") {
-				if j > 0 {
-					pendingSpace = true
-				}
-				if word == "" {
-					continue
-				}
-				place(word, runewidth.StringWidth(word))
-				if paraStart && (word == "•" || word == "-") {
-					hang = curW + 1
-				}
-				paraStart = false
-			}
-		}
-	}
-	endParagraph() // baris baru kosong setelahnya tidak ditampilkan
-	an.syncCursor(stops)
-	return lines, stops
-}
-
-func (m *model) viewAnalysis(b *strings.Builder) {
-	an := m.an
-	w := m.screenWidth()
-	m.line(b, titleStyle.Render("Analisis AI · "+an.root))
-
-	var status string
-	switch an.phase {
-	case anCollect:
-		status = fmt.Sprintf("Mengumpulkan data… %s file · %s · %.0f detik · esc batal",
-			format.Int(an.prog.Files.Load()), format.Bytes(an.prog.Bytes.Load()), time.Since(an.start).Seconds())
-	case anWaiting:
-		status = fmt.Sprintf("Menunggu jawaban AI (%s)… %.0f detik · %s baris dikirim · esc batal",
-			an.model, time.Since(an.start).Seconds(), format.Int(int64(an.snap.Lines)))
-	case anDone:
-		status = fmt.Sprintf("Selesai dalam %.0f detik · %s · %s baris dikirim · %d folder/file disebut",
-			an.elapsed.Seconds(), an.model, format.Int(int64(an.snap.Lines)), len(an.res.Mentions))
-	case anFailed:
-		status = warnStyle.Render("Gagal: " + an.err.Error())
-	}
-	m.line(b, dimStyle.Render(status))
-	b.WriteString("\n")
-
-	h := m.listHeight()
-	cursorLine := -1
-	var lines []string
-	switch {
-	case an.showData:
-		lines = m.dataLines(an)
-		if stops := an.dataStops(); len(stops) > 0 {
-			cursorLine = stops[min(an.dataCursor, len(stops)-1)]
-		}
-	case an.phase == anDone:
-		an.lastW = max(w-2, 20)
-		var stops []stop
-		lines, stops = m.layoutAnswer(an, an.lastW)
-		if len(stops) > 0 {
-			cursorLine = stops[an.cursor].line
-		}
-	case an.snap != nil:
-		lines = []string{dimStyle.Render(fmt.Sprintf(
-			"Data: %s baris mewakili %s file · %s folder · %s. Tekan v untuk melihatnya.",
-			format.Int(int64(an.snap.Lines)), format.Int(an.snap.Files), format.Int(an.snap.Dirs), format.Bytes(an.snap.Size)))}
-	}
-	if an.phase == anFailed && !an.showData {
-		// Pesan error lengkap, dibungkus agar tidak terpotong di baris status.
-		lines = append(lines, "")
-		for _, l := range strings.Split(ansi.Wrap("Gagal: "+an.err.Error(), max(w-2, 20), ""), "\n") {
-			lines = append(lines, warnStyle.Render(l))
-		}
-		hint := "Tekan r untuk mencoba lagi atau esc untuk kembali."
-		if errors.Is(an.err, analyze.ErrInvalidKey) {
-			hint = "API key ditolak. Tekan p untuk mengganti API key, model, atau provider, lalu r untuk mencoba lagi."
-		}
-		lines = append(lines, "", dimStyle.Render(hint))
-		if an.snap != nil {
-			lines = append(lines, dimStyle.Render("Data folder tetap bisa dipakai: tekan v untuk memilih, membuka, atau menghapus isinya."))
-		}
-	}
-	if !an.free && cursorLine >= 0 {
-		if cursorLine < an.textOff {
-			an.textOff = cursorLine
-		}
-		if cursorLine >= an.textOff+h {
-			an.textOff = cursorLine - h + 1
-		}
-	}
-	an.textOff = min(max(an.textOff, 0), max(len(lines)-h, 0))
-	for i := range h {
-		if j := an.textOff + i; j < len(lines) {
-			m.line(b, " "+lines[j])
-		} else {
-			b.WriteString("\n")
-		}
-	}
-
-	status = warnStyle.Render(m.status)
-	switch n, size := an.marked(); {
-	case m.status != "":
-	case n > 0:
-		status = markStyle.Render(fmt.Sprintf("%d ditandai · %s · d hapus · space lepas tanda", n, format.Bytes(size)))
-	case len(lines) > h:
-		status = dimStyle.Render(fmt.Sprintf("baris %d–%d dari %d", an.textOff+1, min(an.textOff+h, len(lines)), len(lines)))
-	}
-	m.line(b, status)
-	keyText := keysAnalysis
-	if an.showData {
-		keyText = keysData
-	}
-	keys := dimStyle.Render(keyText)
-	if lipgloss.Width(keys) > w {
-		keys = truncateANSI(keys, w)
-	}
-	b.WriteString(keys)
-}
-
 // marked mengembalikan jumlah dan total ukuran item yang ditandai.
 func (an *analysis) marked() (n int, size int64) {
 	for p, it := range an.markItems {
@@ -666,33 +806,4 @@ func (an *analysis) marked() (n int, size int64) {
 		}
 	}
 	return n, size
-}
-
-// dataLines menyusun tampilan data folder: setiap baris item bisa dipilih,
-// dengan kolom tanda di kiri untuk ✓ (ditandai) dan baris terhapus diredupkan.
-func (m *model) dataLines(an *analysis) []string {
-	stops := an.dataStops()
-	sel := -1
-	if len(stops) > 0 {
-		sel = stops[min(an.dataCursor, len(stops)-1)]
-	}
-	raw := strings.Split(strings.TrimRight(an.snap.Text, "\n"), "\n")
-	out := make([]string, len(raw))
-	for i, l := range raw {
-		it := an.snap.Items[an.snap.LineIDs[i]]
-		gutter := "  "
-		switch {
-		case an.gone[it.Path]:
-			l = dimStyle.Render(l + "  · terhapus")
-		case i == sel:
-			// Sorot dari nomor [id] sampai akhir; indentasi tetap biasa.
-			trimmed := strings.TrimLeft(l, " ")
-			l = l[:len(l)-len(trimmed)] + selStyle.Render(trimmed)
-		}
-		if an.marks[it.Path] {
-			gutter = markStyle.Render("✓") + " "
-		}
-		out[i] = gutter + l
-	}
-	return out
 }

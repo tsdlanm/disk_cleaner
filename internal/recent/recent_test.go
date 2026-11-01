@@ -41,7 +41,7 @@ func setCreated(t *testing.T, path string, ct time.Time) {
 func TestScanFiles(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now()
-	opt := Options{Days: 7, MinFile: 1000}
+	opt := Options{MinFile: 1000}
 	files := []struct {
 		rel     string
 		size    int
@@ -62,7 +62,7 @@ func TestScanFiles(t *testing.T) {
 		setCreated(t, p, f.created)
 	}
 
-	rep, err := Scan(t.Context(), []Root{{Path: root}}, opt, "", nil)
+	rep, err := Scan(t.Context(), []Root{{Path: root}}, opt, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestScanInvalidCreation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rep, err := Scan(t.Context(), []Root{{Path: root}}, Options{Days: 7, MinFile: 1000}, "", nil)
+	rep, err := Scan(t.Context(), []Root{{Path: root}}, Options{MinFile: 1000}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestScanOnDir(t *testing.T) {
 		got[path] = inf
 		mu.Unlock()
 	}
-	if _, err := Scan(t.Context(), []Root{{Path: root}}, opt, "", nil); err != nil {
+	if _, err := Scan(t.Context(), []Root{{Path: root}}, opt, nil); err != nil {
 		t.Fatal(err)
 	}
 	// Setiap folder dilaporkan dengan ukuran dan jumlah rekursif.
@@ -157,7 +157,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	in := &Snapshot{
 		Time: now,
-		Report: &Report{Since: now.AddDate(0, 0, -7), Drives: []DriveReport{{
+		Report: &Report{Since: now.Add(-Window), Drives: []DriveReport{{
 			Root: `C:\`, FileSize: 5000,
 			Files: []File{{Path: `C:\dl\a.iso`, Size: 5000, Created: now, Kind: KindUser}},
 		}}},
@@ -175,27 +175,5 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if _, err := LoadSnapshot(path + ".tidak-ada"); err == nil {
 		t.Error("snapshot yang tidak ada seharusnya error")
-	}
-}
-
-func TestScanGrowth(t *testing.T) {
-	root, base := t.TempDir(), t.TempDir()
-	write(t, filepath.Join(root, "a.bin"), 10000)
-
-	rep, err := Scan(t.Context(), []Root{{Path: root}}, DefaultOptions, base, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !rep.Drives[0].GrowthSince.IsZero() {
-		t.Fatal("pemindaian pertama seharusnya belum punya pembanding")
-	}
-
-	write(t, filepath.Join(root, "b.bin"), 5000)
-	rep, err = Scan(t.Context(), []Root{{Path: root}}, DefaultOptions, base, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if d := rep.Drives[0]; d.GrowthSince.IsZero() || d.Growth != 5000 {
-		t.Errorf("Growth = %d sejak %v, want +5000", d.Growth, d.GrowthSince)
 	}
 }

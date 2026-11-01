@@ -18,7 +18,7 @@ import (
 	"github.com/mattn/go-runewidth"
 
 	"github.com/tsdlanm/cli_app/internal/analyze"
-
+	"github.com/tsdlanm/cli_app/internal/bin"
 	"github.com/tsdlanm/cli_app/internal/drives"
 	"github.com/tsdlanm/cli_app/internal/format"
 
@@ -67,7 +67,6 @@ type model struct {
 
 	cursor, offset int
 	follow         bool // kursor mengikuti item saat diurutkan ulang (false: tetap di posisinya)
-	byName         bool
 	width, height  int
 
 	remember map[string]string // folder -> nama item yang terakhir dipilih
@@ -80,11 +79,13 @@ type model struct {
 
 	marks map[string]bool      // path item yang ditandai di folder ini
 	trash func([]string) error // memindahkan item ke Recycle Bin
+	// dirExists memeriksa apakah folder masih ada (diganti di tes).
+	dirExists func(string) bool
 
 	cfg         analyze.Config
 	newProvider func(analyze.Config) (analyze.Provider, error)
 	an          *analysis // layar analisis AI yang sedang terbuka
-	lastAn      *analysis // analisis terakhir, bisa dibuka lagi dengan b
+	lastAn      *analysis // analisis yang sedang berjalan (sama dengan an); tidak disimpan setelah ditutup
 	anSeq       int       // nomor analisis terakhir; pesan dari analisis lama diabaikan
 	settings    *settings // layar Pengaturan AI yang sedang terbuka
 
@@ -95,17 +96,31 @@ type model struct {
 	recentProg    *recent.Progress
 	recent        *recent.Report
 	recentErr     error
-	recentShown   map[string]int // jumlah folder yang ditampilkan per drive
-	recentAt      time.Time      // waktu pemindaian data yang sedang tampil
+	recentAt      time.Time // waktu pemindaian data yang sedang tampil
 
-	focusRecent bool // kursor ada di bagian "File baru"
+	page        int  // halaman utama yang tampil: pageDrives, pageBin
+	focusRecent bool // kursor di bagian "File baru" (di bawah daftar drive)
 	rcursor     int
 	roffset     int
-	rgroups     map[int]driveGroups   // folder berisi file baru per drive; nil = susun ulang
-	rexpand     map[string]bool       // drive yang bagian cache/aplikasi/sistem-nya dibuka
+	rfiles      []rfile               // file di halaman "File baru"; nil = susun ulang
+	rplaces     []place               // file baru per tempat; nil = susun ulang
+	rshown      map[int]int           // jumlah folder yang tampil per drive; kosong = recentPage
+	rclosed     map[int]bool          // drive yang isinya ditutup di "File baru" (tinggal judul)
 	rnew        *newIndex             // penanda file baru di explorer; nil = susun ulang
+	shortHome   string                // nama pendek 8.3 folder profil; "-" jika tidak ada
 	snapDirs    map[string]sizer.Info // ukuran folder dari pemindaian, untuk snapshot
 	dataFresh   time.Time             // data "File baru" lengkap sampai saat ini
+
+	binItems   []bin.Item
+	binErr     error
+	binLoaded  bool
+	bcursor    int
+	boffset    int
+	bmarks     map[string]bool // file $I item yang ditandai
+	binList    func(roots []string) ([]bin.Item, error)
+	binRestore func(bin.Item) error
+	binPurge   func(bin.Item) error
+	binEmpty   func() error
 
 	// background: saat mulai, nyalakan pemantauan langsung (dimatikan di tes).
 	background bool
@@ -122,9 +137,17 @@ type model struct {
 type popup struct {
 	title   string
 	lines   []string
-	confirm []string // path yang dihapus jika dikonfirmasi; nil untuk popup info
-	hint    string   // teks tombol di bawah popup; kosong memakai bawaan
+	confirm []string       // path yang dihapus jika dikonfirmasi; nil untuk popup info
+	onYes   func() tea.Cmd // aksi lain yang dijalankan jika dikonfirmasi dengan y
+	hint    string         // teks tombol di bawah popup; kosong memakai bawaan
 }
+
+// Halaman di halaman utama; tab berpindah ke halaman berikutnya.
+const (
+	pageDrives = iota // daftar drive, dengan "File baru" di bawahnya
+	pageBin
+	pageCount
+)
 
 // Options mengatur TUI saat dijalankan.
 type Options struct {
@@ -162,6 +185,8 @@ func newModel(sz *sizer.Sizer) *model {
 	return &model{
 		sz: sz, remember: make(map[string]string), marks: make(map[string]bool), trash: trash.Move,
 		cfg: analyze.DefaultConfig, newProvider: analyze.Config.NewProvider,
+		dirExists: func(p string) bool { _, err := os.Stat(p); return !os.IsNotExist(err) },
+		bmarks:    make(map[string]bool), binList: bin.List, binRestore: bin.Restore, binPurge: bin.Purge, binEmpty: bin.Empty,
 	}
 }
 
@@ -235,7 +260,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.recentStarted = true
 			// Hasil pemindaian tersimpan dimuat dulu; pemindaian penuh hanya
 			// jika belum ada atau sudah terlalu lama (lihat updateRecent).
-			cmds := []tea.Cmd{loadSnapshot}
+			cmds := []tea.Cmd{loadSnapshot, m.loadBin()}
 			if m.background {
 				cmds = append(cmds, m.startLive())
 			}
@@ -247,6 +272,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case liveMsg:
 		cmd = m.updateLive(msg)
+
+	case binMsg, binOpMsg:
+		cmd = m.updateBin(msg)
 
 	case dirMsg:
 		if msg.err != nil {
@@ -275,7 +303,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cmd = m.startTick()
 
-	case snapMsg, aiMsg, anTickMsg:
+	case snapMsg, aiMsg, chatMsg, anTickMsg:
 		cmd = m.updateAnalysis(msg)
 
 	case deleteMsg:
@@ -301,7 +329,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.status = fmt.Sprintf("%d dari %d item gagal dihapus", msg.failed, len(msg.paths))
 		}
-		cmd = loadDrives
+		cmd = tea.Batch(loadDrives, m.loadBin())
 		if m.path != "" {
 			cmd = tea.Batch(cmd, loadDir(m.path))
 		}
@@ -319,9 +347,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = m.updateExp(msg)
 
 	case tea.KeyMsg:
-		if m.settings != nil {
+		switch {
+		case m.settings != nil:
 			cmd = m.handleSettingsKey(msg)
-		} else {
+		case m.an != nil && m.popup == nil:
+			// Layar analisis membaca huruf yang diketik, bukan hanya nama tombol.
+			cmd = m.handleAnalysisKey(msg)
+		default:
 			cmd = m.handleKey(msg.String())
 		}
 	}
@@ -331,6 +363,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *model) handleKey(key string) tea.Cmd {
 	if m.popup != nil {
+		if p := m.popup; p.onYes != nil {
+			switch key {
+			case "ctrl+c":
+				return tea.Quit
+			case "y", "Y":
+				m.popup = nil
+				return p.onYes()
+			case "n", "N", "esc", "q":
+				m.popup = nil
+			}
+			return nil
+		}
 		if p := m.popup; p.confirm != nil {
 			switch key {
 			case "ctrl+c":
@@ -352,18 +396,36 @@ func (m *model) handleKey(key string) tea.Cmd {
 		}
 		return nil
 	}
-	if m.an != nil {
-		return m.handleAnalysisKey(key)
-	}
 	m.status = ""
-	if m.path == "" && m.focusRecent {
-		if cmd, handled := m.handleRecentKey(key); handled {
+	if m.path == "" {
+		switch key {
+		case "tab":
+			return m.setPage((m.page + 1) % pageCount)
+		case "shift+tab":
+			return m.setPage((m.page + pageCount - 1) % pageCount)
+		}
+		var cmd tea.Cmd
+		handled := false
+		switch {
+		case m.page == pageBin:
+			cmd, handled = m.handleBinKey(key)
+		case m.focusRecent:
+			cmd, handled = m.handleRecentKey(key)
+		case (key == "down" || key == "j") && m.cursor >= len(m.drives)-1 && len(m.places()) > 0:
+			// Dari drive terakhir turun ke bagian "File baru".
+			m.focusRecent, m.rcursor = true, 0
+			return nil
+		}
+		if handled {
 			return cmd
 		}
-	}
-	if m.path == "" && key == "tab" {
-		m.focusRecent = m.hasRecentFiles()
-		return nil
+		if m.page != pageDrives {
+			switch key {
+			case "ctrl+c", "q", "p", "A":
+			default:
+				return nil // tombol explorer/drive tidak berlaku di halaman ini
+			}
+		}
 	}
 	switch key {
 	case "up", "k", "down", "j", "pgup", "pgdown", "home", "g", "end", "G":
@@ -400,11 +462,6 @@ func (m *model) handleKey(key string) tea.Cmd {
 		return m.up()
 	case "esc":
 		return m.home()
-	case "s":
-		if m.path != "" {
-			m.byName = !m.byName
-			m.refresh()
-		}
 	case "r":
 		if m.path == "" {
 			return tea.Batch(loadDrives, m.startRecent())
@@ -430,13 +487,6 @@ func (m *model) handleKey(key string) tea.Cmd {
 		return m.requestAnalysis()
 	case "p":
 		m.openSettings("", false)
-
-	case "b":
-		if m.lastAn == nil {
-			m.status = "Belum ada hasil analisis AI"
-			return nil
-		}
-		m.an = m.lastAn
 	case "A":
 		if m.admin {
 			m.status = "Sudah berjalan sebagai Administrator"
@@ -444,6 +494,15 @@ func (m *model) handleKey(key string) tea.Cmd {
 		}
 		m.elevate = true
 		return tea.Quit
+	}
+	return nil
+}
+
+// setPage pindah ke halaman utama page; Recycle Bin dibaca ulang setiap kali dibuka.
+func (m *model) setPage(page int) tea.Cmd {
+	m.page = page
+	if page == pageBin {
+		return m.loadBin()
 	}
 	return nil
 }
@@ -615,7 +674,7 @@ func (m *model) home() tea.Cmd {
 func (m *model) refresh() {
 	sel := m.selectedName()
 	m.total, m.pending = fillSizes(m.sz, m.rows)
-	sortRows(m.rows, m.byName)
+	sortRows(m.rows)
 	if !m.follow {
 		return
 	}
@@ -648,19 +707,9 @@ func fillSizes(sz *sizer.Sizer, rows []row) (total int64, pending int) {
 	return total, pending
 }
 
-// sortRows mengurutkan baris dari yang terbesar, atau menurut nama
-// (folder lebih dulu) jika byName.
-func sortRows(rows []row, byName bool) {
+// sortRows mengurutkan baris dari yang terbesar; yang sama besar menurut nama.
+func sortRows(rows []row) {
 	slices.SortStableFunc(rows, func(a, b row) int {
-		if byName {
-			if a.isDir != b.isDir {
-				if a.isDir {
-					return -1
-				}
-				return 1
-			}
-			return strings.Compare(strings.ToLower(a.name), strings.ToLower(b.name))
-		}
 		if a.size != b.size {
 			if a.size > b.size {
 				return -1

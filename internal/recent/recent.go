@@ -3,7 +3,6 @@ package recent
 
 import (
 	"context"
-	"encoding/gob"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -17,13 +16,12 @@ import (
 	"github.com/tsdlanm/cli_app/internal/sizer"
 )
 
+// Window adalah rentang "baru": file yang dibuat dalam 24 jam terakhir.
+const Window = 24 * time.Hour
+
 // Options mengatur pemindaian.
 type Options struct {
-	Days    int   // rentang "baru", dalam hari
 	MinFile int64 // file di bawah ukuran ini tidak didaftar (tetap dihitung di Small)
-	// GrowthDays adalah umur data pembanding ukuran drive sebelum diganti
-	// (lihat DriveReport.Growth); bawaan sama dengan Days.
-	GrowthDays int
 	// Ignore berisi folder yang file-nya tidak pernah didaftar, misalnya
 	// folder data program ini sendiri.
 	Ignore []string
@@ -33,17 +31,11 @@ type Options struct {
 }
 
 // DefaultOptions dipakai jika konfigurasi tidak mengatur nilai.
-var DefaultOptions = Options{Days: 7, MinFile: 1 << 20}
+var DefaultOptions = Options{MinFile: 1 << 20}
 
 func (o Options) withDefaults() Options {
-	if o.Days <= 0 {
-		o.Days = DefaultOptions.Days
-	}
 	if o.MinFile <= 0 {
 		o.MinFile = DefaultOptions.MinFile
-	}
-	if o.GrowthDays <= 0 {
-		o.GrowthDays = o.Days
 	}
 	return o
 }
@@ -93,11 +85,6 @@ type DriveReport struct {
 	// dihitung, tidak didaftar.
 	SmallSize  int64
 	SmallCount int64
-
-	// Growth adalah pertambahan bersih ukuran drive sejak GrowthSince;
-	// hanya ada jika pemindaian sebelumnya tersimpan.
-	Growth      int64
-	GrowthSince time.Time
 
 	idx *index // untuk Apply; tidak ikut disimpan
 }
@@ -164,15 +151,13 @@ type scan struct {
 	denied int64
 }
 
-// Scan memindai roots. baseDir adalah folder untuk menyimpan ukuran drive
-// sebagai pembanding; kosong berarti tanpa pembanding.
-func Scan(ctx context.Context, roots []Root, opt Options, baseDir string, p *Progress) (*Report, error) {
+// Scan memindai roots dan mendaftar file yang dibuat dalam Window terakhir.
+func Scan(ctx context.Context, roots []Root, opt Options, p *Progress) (*Report, error) {
 	if p == nil {
 		p = &Progress{}
 	}
 	opt = opt.withDefaults()
-	now := time.Now()
-	rep := &Report{Since: now.AddDate(0, 0, -opt.Days)}
+	rep := &Report{Since: time.Now().Add(-Window)}
 
 	// Semua drive dipindai bersamaan agar selesai secepat mungkin; kuota
 	// paralel tetap dibagi lewat sizer.Slots.
@@ -183,14 +168,11 @@ func Scan(ctx context.Context, roots []Root, opt Options, baseDir string, p *Pro
 		go func() {
 			defer wg.Done()
 			s := &scan{ctx: ctx, p: p, opt: opt, since: rep.Since}
-			size := s.walk(root.Path, true, KindUser).Size
+			s.walk(root.Path, true, KindUser)
 			slices.SortFunc(s.files, func(a, b File) int { return b.Created.Compare(a.Created) })
 			d := DriveReport{Root: root.Path, Files: s.files, SmallSize: s.small, SmallCount: s.smallN}
 			for _, f := range s.files {
 				d.FileSize += f.Size
-			}
-			if baseDir != "" && ctx.Err() == nil {
-				d.Growth, d.GrowthSince = compare(baseDir, root.Path, size, opt.GrowthDays, now)
 			}
 			rep.Drives[i] = d
 		}()
@@ -328,34 +310,4 @@ func fileTime(ft syscall.Filetime) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return t, true
-}
-
-type baseline struct {
-	Time time.Time
-	Size int64
-}
-
-func baselinePath(baseDir, root string) string {
-	name := strings.TrimRight(strings.ReplaceAll(root, `:`, ""), `\/`)
-	return filepath.Join(baseDir, "size-"+name+".gob")
-}
-
-// compare mengembalikan pertambahan ukuran drive sejak pemindaian yang
-// tersimpan, lalu memperbarui data itu jika sudah lebih lama dari rentang hari.
-func compare(baseDir, root string, size int64, days int, now time.Time) (growth int64, since time.Time) {
-	path := baselinePath(baseDir, root)
-	var old baseline
-	if f, err := os.Open(path); err == nil {
-		if gob.NewDecoder(f).Decode(&old) != nil {
-			old = baseline{}
-		}
-		f.Close()
-	}
-	if !old.Time.IsZero() {
-		growth, since = size-old.Size, old.Time
-	}
-	if old.Time.IsZero() || now.Sub(old.Time) >= time.Duration(days)*24*time.Hour {
-		_ = writeGob(path, baseline{Time: now, Size: size})
-	}
-	return growth, since
 }
