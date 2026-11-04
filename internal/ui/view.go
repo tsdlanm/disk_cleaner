@@ -34,8 +34,8 @@ var (
 )
 
 const (
-	keysDrives = "↑↓ pilih · enter buka · tab Recycle Bin · a analisis · r pindai · q keluar"
-	keysRecent = "↑↓ pilih · enter masuk · ← tutup drive · a analisis · o Explorer · esc kembali · q keluar"
+	keysDrives = "↑↓ pilih · enter buka · tab File baru · a analisis · r pindai · q keluar"
+	keysRecent = "↑↓ pilih · enter masuk · ← tutup · t rentang · a analisis · o Explorer · r pindai · q keluar"
 	keysBin    = "↑↓ pilih · space tandai · u pulihkan · d hapus · E kosongkan · esc kembali · q keluar"
 	keysDir    = "↑↓ pilih · enter buka · ← naik · space tandai · d hapus · a analisis · o Explorer · q keluar"
 )
@@ -75,9 +75,8 @@ func (m *model) footerKeys(keys string) string {
 	return keys + " · p pengaturan"
 }
 
-// viewHome menulis halaman utama: baris tab (Drive · Recycle Bin),
-// ringkasan halaman yang terbuka, lalu isinya. Halaman Drive memuat bagian
-// "File baru" di bawah daftar drive.
+// viewHome menulis halaman utama: baris tab (Drive · File baru · Recycle Bin),
+// ringkasan halaman yang terbuka, lalu isinya.
 func (m *model) viewHome(b *strings.Builder) {
 	m.line(b, m.tabs())
 	h := m.listHeight()
@@ -89,6 +88,11 @@ func (m *model) viewHome(b *strings.Builder) {
 		m.line(b, m.binTopLine())
 		used = m.viewBinList(b, h)
 		keys = keysBin
+	case pageRecent:
+		m.line(b, m.recentHeader())
+		m.line(b, m.recentTopLine())
+		used = m.viewRecentList(b, h)
+		keys = keysRecent
 	default:
 		mode := "Administrator"
 		if !m.admin {
@@ -97,19 +101,11 @@ func (m *model) viewHome(b *strings.Builder) {
 		m.line(b, dimStyle.Render(fmt.Sprintf("%d drive · %s", len(m.drives), mode)))
 		b.WriteString("\n")
 		used = m.viewDrives(b, h)
-		if h-used > 3 {
-			b.WriteString("\n")
-			used++
-			used += m.viewRecent(b, h-used)
-		}
-		if m.focusRecent {
-			keys = keysRecent
-		}
 	}
 	for range h - used {
 		b.WriteString("\n")
 	}
-	if m.page == pageDrives && !m.focusRecent {
+	if m.page == pageDrives {
 		keys = m.footerKeys(keys)
 	}
 	m.footer(b, keys)
@@ -117,7 +113,7 @@ func (m *model) viewHome(b *strings.Builder) {
 
 // tabs adalah baris judul halaman utama; halaman yang terbuka ditebalkan.
 func (m *model) tabs() string {
-	names := []string{"Drive", "Recycle Bin"}
+	names := []string{"Drive", "File baru", "Recycle Bin"}
 	if m.binLoaded && m.binErr == nil {
 		var size int64
 		for _, it := range m.binItems {
@@ -143,7 +139,7 @@ func (m *model) viewDrives(b *strings.Builder, h int) int {
 		used++
 		d := m.drives[i]
 		name := d.Root + "  " + runewidth.FillRight(runewidth.Truncate(d.Label, 16, "…"), 16)
-		if i == m.cursor && !m.focusRecent {
+		if i == m.cursor {
 			name = selStyle.Render(name)
 		} else {
 			name = dirStyle.Render(name)
@@ -170,7 +166,7 @@ func (m *model) viewDir(b *strings.Builder) {
 
 	summary := fmt.Sprintf("%s · %s item", format.Bytes(m.total), format.Int(int64(len(m.rows))))
 	if n := m.newFiles().dirs[filepath.Clean(m.path)]; n > 0 {
-		summary += fmt.Sprintf(" · %s file baru di sini (24 jam)", format.Int(int64(n)))
+		summary += fmt.Sprintf(" · %s file baru di sini (%s)", format.Int(int64(n)), rangeLabel(m.rrange))
 	}
 	if m.pending > 0 {
 		summary += fmt.Sprintf(" · menghitung %d folder…", m.pending)
@@ -217,7 +213,7 @@ func (m *model) viewDir(b *strings.Builder) {
 		size = fmt.Sprintf("%11s", size)
 		pct = fmt.Sprintf("%6s", pct)
 
-		// Penanda file baru (24 jam terakhir), atau jumlah file baru di dalam folder.
+		// Penanda file baru (dalam rentang yang dipilih), atau jumlah file baru di dalam folder.
 		tag := ""
 		created, isNew := m.newFiles().files[r.path]
 		switch {

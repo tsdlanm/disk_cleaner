@@ -32,7 +32,7 @@ func TestLiveUpdate(t *testing.T) {
 	m.Update(recentMsg{rep: &recent.Report{Drives: []recent.DriveReport{{
 		Root: vol, Files: []recent.File{{Path: old, Size: 2 << 20, Created: time.Now().Add(-time.Hour)}},
 	}}}, at: time.Now()})
-	key(m, "down") // judul drive
+	key(m, "tab") // halaman File baru: kursor di judul drive
 	key(m, "down")
 	sel := m.selectedRecent()
 	if sel == "" {
@@ -125,10 +125,9 @@ func TestJumpFirstLast(t *testing.T) {
 
 	// File baru: g ke baris pertama (judul drive), G ke baris terakhir.
 	m.Update(recentMsg{rep: recentReport(3, `C:\`, `D:\`)})
-	key(m, "G")    // drive terakhir
-	key(m, "down") // turun ke File baru
+	key(m, "tab") // halaman File baru
 	if !m.focusRecent {
-		t.Fatal("↓ dari drive terakhir tidak masuk ke File baru")
+		t.Fatal("tab tidak membuka halaman File baru")
 	}
 	key(m, "down")
 	key(m, "G")
@@ -139,9 +138,7 @@ func TestJumpFirstLast(t *testing.T) {
 	if m.rcursor != 0 {
 		t.Errorf("File baru: g → %d, want 0", m.rcursor)
 	}
-	key(m, "esc") // kembali ke daftar drive
-
-	// Recycle Bin.
+	// Recycle Bin: tab berikutnya.
 	key(m, "tab")
 	key(m, "G")
 	if m.bcursor != 2 {

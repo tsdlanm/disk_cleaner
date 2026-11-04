@@ -98,8 +98,9 @@ type model struct {
 	recentErr     error
 	recentAt      time.Time // waktu pemindaian data yang sedang tampil
 
-	page        int  // halaman utama yang tampil: pageDrives, pageBin
-	focusRecent bool // kursor di bagian "File baru" (di bawah daftar drive)
+	page        int           // halaman utama yang tampil: pageDrives, pageRecent, pageBin
+	focusRecent bool          // halaman "File baru" yang tampil (kursor ada di daftarnya)
+	rrange      time.Duration // rentang "File baru" yang dipilih: 24 jam (bawaan) atau 7 hari
 	rcursor     int
 	roffset     int
 	rfiles      []rfile               // file di halaman "File baru"; nil = susun ulang
@@ -144,7 +145,8 @@ type popup struct {
 
 // Halaman di halaman utama; tab berpindah ke halaman berikutnya.
 const (
-	pageDrives = iota // daftar drive, dengan "File baru" di bawahnya
+	pageDrives = iota // daftar drive
+	pageRecent        // file baru per drive
 	pageBin
 	pageCount
 )
@@ -184,7 +186,7 @@ func Run(opts Options) (Result, error) {
 func newModel(sz *sizer.Sizer) *model {
 	return &model{
 		sz: sz, remember: make(map[string]string), marks: make(map[string]bool), trash: trash.Move,
-		cfg: analyze.DefaultConfig, newProvider: analyze.Config.NewProvider,
+		cfg: analyze.DefaultConfig, newProvider: analyze.Config.NewProvider, rrange: rangeDay,
 		dirExists: func(p string) bool { _, err := os.Stat(p); return !os.IsNotExist(err) },
 		bmarks:    make(map[string]bool), binList: bin.List, binRestore: bin.Restore, binPurge: bin.Purge, binEmpty: bin.Empty,
 	}
@@ -411,10 +413,6 @@ func (m *model) handleKey(key string) tea.Cmd {
 			cmd, handled = m.handleBinKey(key)
 		case m.focusRecent:
 			cmd, handled = m.handleRecentKey(key)
-		case (key == "down" || key == "j") && m.cursor >= len(m.drives)-1 && len(m.places()) > 0:
-			// Dari drive terakhir turun ke bagian "File baru".
-			m.focusRecent, m.rcursor = true, 0
-			return nil
 		}
 		if handled {
 			return cmd
@@ -501,6 +499,7 @@ func (m *model) handleKey(key string) tea.Cmd {
 // setPage pindah ke halaman utama page; Recycle Bin dibaca ulang setiap kali dibuka.
 func (m *model) setPage(page int) tea.Cmd {
 	m.page = page
+	m.focusRecent = page == pageRecent
 	if page == pageBin {
 		return m.loadBin()
 	}

@@ -881,8 +881,9 @@ func TestRecent(t *testing.T) {
 	m := newModel(sizer.New())
 	m.Update(tea.WindowSizeMsg{Width: 140, Height: 80})
 	m.Update(recentMsg{rep: recentReport(30, `C:\`, `D:\`)})
+	m.setPage(pageRecent)
 
-	// "File baru" ada di halaman Drive, di bawah daftar drive: hanya 24 jam
+	// "File baru" punya halaman sendiri (tab kedua): rentang bawaan 24 jam
 	// terakhir, per drive, dari yang terbaru. Folder berisi satu file
 	// langsung menampilkan nama file itu; path lengkapnya tampil di atas
 	// bagian ini saat kursor di barisnya.
@@ -904,11 +905,9 @@ func TestRecent(t *testing.T) {
 		t.Errorf("%d baris folder (want 20), tombol lainnya:\n%s", n, v)
 	}
 
-	// ↓ dari drive terakhir masuk ke File baru: mendarat di judul drive C,
-	// lalu ↓ lagi ke folder pertamanya.
-	key(m, "down")
+	// Kursor mulai di judul drive C; ↓ ke folder pertamanya.
 	if l, _ := m.recentCurrent(); !m.focusRecent || l.place != placeTitle || l.drive != 0 {
-		t.Fatalf("↓: fokus %v, baris %+v, want judul drive C", m.focusRecent, l)
+		t.Fatalf("awal: fokus %v, baris %+v, want judul drive C", m.focusRecent, l)
 	}
 	key(m, "down")
 	if !m.focusRecent || m.selectedRecent() != `C:\proj00` {
@@ -944,9 +943,9 @@ func TestRecent(t *testing.T) {
 		t.Errorf("urutan berubah: pertama %s, kursor %s", ps[0].dir, m.selectedRecent())
 	}
 
-	// esc kembali ke daftar drive.
+	// esc kembali ke halaman Drive.
 	key(m, "esc")
-	if m.focusRecent {
+	if m.focusRecent || m.page != pageDrives {
 		t.Error("esc tidak kembali ke daftar drive")
 	}
 }
@@ -955,7 +954,8 @@ func TestRecentScrollKeepsDriveTitle(t *testing.T) {
 	m := newModel(sizer.New())
 	m.Update(tea.WindowSizeMsg{Width: 140, Height: 14})
 	m.Update(recentMsg{rep: recentReport(20, `C:\`, `D:\`)})
-	for range 13 {
+	m.setPage(pageRecent)
+	for range 12 {
 		key(m, "down")
 	}
 	if strings.Contains(m.View(), `C:\ · 20 file baru`) {
@@ -978,13 +978,13 @@ func TestRecentCollapseDrive(t *testing.T) {
 	m := newModel(sizer.New())
 	m.Update(tea.WindowSizeMsg{Width: 140, Height: 80})
 	m.Update(recentMsg{rep: recentReport(12, `C:\`, `D:\`)})
+	m.setPage(pageRecent)
 	count := func() int { return strings.Count(m.View(), "f.bin") }
 	if count() != 20 {
 		t.Fatalf("awal: %d folder tampil, want 20", count())
 	}
 
-	key(m, "down") // judul drive C
-	key(m, "enter")
+	key(m, "enter") // kursor sudah di judul drive C
 	v := m.View()
 	if count() != 10 || !strings.Contains(v, "▸ C:\\") || !strings.Contains(v, "▾ D:\\") || strings.Count(v, "(2 folder lagi)") != 1 {
 		t.Errorf("C ditutup, D tetap terbuka (%d folder):\n%s", count(), v)
@@ -1025,10 +1025,14 @@ func TestRecentCollapseDrive(t *testing.T) {
 	if m.rclosed[0] || count() != 20 {
 		t.Errorf("→: C ditutup %v, %d folder", m.rclosed[0], count())
 	}
-	// ↑ dari judul drive pertama kembali ke daftar drive.
+	// ↑ dari judul drive pertama tetap di sana; esc kembali ke halaman Drive.
 	key(m, "up")
-	if m.focusRecent {
-		t.Error("↑ dari judul pertama tidak kembali ke daftar drive")
+	if !m.focusRecent || m.rcursor != 0 {
+		t.Errorf("↑ dari judul pertama: fokus %v, kursor %d", m.focusRecent, m.rcursor)
+	}
+	key(m, "esc")
+	if m.focusRecent || m.page != pageDrives {
+		t.Error("esc tidak kembali ke halaman Drive")
 	}
 }
 
@@ -1038,11 +1042,11 @@ func TestRecentCollapseSteps(t *testing.T) {
 	m := newModel(sizer.New())
 	m.Update(tea.WindowSizeMsg{Width: 140, Height: 90})
 	m.Update(recentMsg{rep: recentReport(24, `C:\`)}) // 24 folder: semua masuk jendela 24 jam
+	m.setPage(pageRecent)
 	count := func() int { return strings.Count(m.View(), "f.bin") }
 
 	// Buka sampai semua tampil: 10 → 20 → 24.
-	key(m, "down") // judul drive
-	for _, want := range []int{20, 24} {
+	for _, want := range []int{20, 24} { // kursor sudah di judul drive
 		for range m.visibleCount(0) + 1 { // ke tombol "tampilkan lainnya"
 			key(m, "down")
 		}
@@ -1122,6 +1126,7 @@ func TestRecentPlaces(t *testing.T) {
 	}
 	d.Files = append(d.Files, recent.File{Path: `D:\unduhan\film.mp4`, Size: 700 << 20, Created: now.Add(-time.Hour)})
 	m.Update(recentMsg{rep: &recent.Report{Drives: []recent.DriveReport{d}}})
+	m.setPage(pageRecent)
 
 	v := m.View()
 	for _, want := range []string{`D:\ · 9 file baru · 2 folder`, "app\\", "8 file", "36.0 MB", "film.mp4", "700.0 MB", "1 menit lalu"} {
@@ -1133,8 +1138,7 @@ func TestRecentPlaces(t *testing.T) {
 		t.Errorf("isi folder atau path lengkap ikut tampil di daftar:\n%s", v)
 	}
 
-	key(m, "down")
-	key(m, "down")
+	key(m, "down") // dari judul drive ke folder pertama
 	if v := m.View(); !strings.Contains(v, `D:\proyek\app\`) {
 		t.Errorf("path lengkap folder di kursor tidak tampil di atas:\n%s", v)
 	}
@@ -1160,7 +1164,7 @@ func TestRecentMissingFolder(t *testing.T) {
 		t.Fatalf("places = %d, want 1", len(m.places()))
 	}
 
-	key(m, "down") // judul drive
+	m.setPage(pageRecent)
 	key(m, "down") // folder yang sudah hilang
 	key(m, "enter")
 	if m.path != "" || !m.focusRecent {
@@ -1219,6 +1223,7 @@ func TestSnapshotStartup(t *testing.T) {
 	if inf, st := m.sz.Get(filepath.Join(root, "x")); st != sizer.Done || inf.Size != 7<<20 {
 		t.Errorf("ukuran folder dari snapshot tidak masuk cache: %+v %v", inf, st)
 	}
+	m.setPage(pageRecent)
 	if v := m.View(); !strings.Contains(v, "dipindai 10 menit lalu") || !strings.Contains(v, "1 file") {
 		t.Errorf("View:\n%s", v)
 	}
@@ -1258,14 +1263,14 @@ func TestRecentOpenDelete(t *testing.T) {
 	m.Update(recentMsg{rep: &recent.Report{Drives: []recent.DriveReport{{
 		Root: filepath.VolumeName(root) + `\`, Files: []recent.File{{Path: iso, Size: 100, Created: time.Now().Add(-3 * time.Hour)}},
 	}}}})
+	m.setPage(pageRecent)
 	if v := m.View(); !strings.Contains(v, "1 file") || !strings.Contains(v, "3 jam lalu") {
 		t.Errorf("View:\n%s", v)
 	}
 
 	// enter masuk ke folder tempat itu, kursor di subfolder berisi file baru;
 	// esc kembali ke File baru.
-	key(m, "down")
-	key(m, "down")
+	key(m, "down") // dari judul drive ke folder pertama
 	place := m.places()[0].dir
 	key(m, "enter")
 	if !strings.EqualFold(m.path, place) || m.cursor >= len(m.rows) {
@@ -1312,7 +1317,8 @@ func TestBinPage(t *testing.T) {
 	m.binPurge = func(it bin.Item) error { purged = append(purged, it.Info); return nil }
 	m.binEmpty = func() error { emptied = true; return nil }
 
-	// tab: halaman Recycle Bin, isinya dibaca saat dibuka.
+	// tab dua kali: halaman Recycle Bin (setelah File baru), isinya dibaca saat dibuka.
+	key(m, "tab")
 	key(m, "tab")
 	v := m.View()
 	for _, want := range []string{"Recycle Bin (2 · 5.3 GB)", "✕ Kosongkan Recycle Bin · 2 item · 5.3 GB", "win11.iso", `node_modules\`, "dihapus 2 jam lalu", "5.0 GB"} {
@@ -1381,6 +1387,7 @@ func TestBinEmptyButton(t *testing.T) {
 	}
 	m.binPurge = func(it bin.Item) error { purged = append(purged, it.Info); return nil }
 	m.binEmpty = func() error { emptied = true; return nil }
+	key(m, "tab")
 	key(m, "tab")
 
 	// Kursor awal di item pertama; ↑ ke tombol, dan baris atas menjelaskannya.
@@ -1590,5 +1597,78 @@ func TestResultPercent(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("tidak memuat %q:\n%s", want, out)
 		}
+	}
+}
+// "File baru" punya halaman sendiri dan rentang yang bisa dipilih: 24 jam
+// (bawaan) atau 7 hari. Berganti rentang hanya menyaring, tanpa memindai ulang.
+func TestRecentRange(t *testing.T) {
+	now := time.Now()
+	m := newModel(sizer.New())
+	m.dirExists = func(string) bool { return true }
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	rep := &recent.Report{Since: now.Add(-recent.Window), Drives: []recent.DriveReport{{Root: `C:\`, Files: []recent.File{
+		{Path: `C:\proj\baru.bin`, Size: 2 << 20, Created: now.Add(-2 * time.Hour)},
+		{Path: `C:\unduh\lama.iso`, Size: 3 << 20, Created: now.Add(-3 * 24 * time.Hour)},
+	}}}}
+	m.Update(recentMsg{rep: rep})
+
+	// Halaman Drive hanya berisi daftar drive; tab membuka halaman File baru.
+	if v := m.View(); strings.Contains(v, "baru.bin") || !strings.Contains(v, "File baru") {
+		t.Errorf("halaman Drive:\n%s", v)
+	}
+	key(m, "tab")
+	if m.page != pageRecent || !m.focusRecent || m.rrange != rangeDay {
+		t.Fatalf("tab: halaman %d, fokus %v, rentang %v", m.page, m.focusRecent, m.rrange)
+	}
+
+	// Bawaan 24 jam: hanya file 2 jam lalu.
+	v := m.View()
+	for _, want := range []string{"24 jam", "7 hari", "1 file", "baru.bin"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("24 jam: View tidak memuat %q:\n%s", want, v)
+		}
+	}
+	if strings.Contains(v, "lama.iso") {
+		t.Errorf("file 3 hari lalu tampil di rentang 24 jam:\n%s", v)
+	}
+	if _, ok := m.newFiles().files[`C:\unduh\lama.iso`]; ok {
+		t.Error("penanda explorer memuat file di luar rentang")
+	}
+
+	// t memilih 7 hari: kedua file tampil, yang lama dengan umur "3 hari lalu".
+	key(m, "t")
+	v = m.View()
+	for _, want := range []string{"2 file", "baru.bin", "lama.iso", "3 hari lalu"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("7 hari: View tidak memuat %q:\n%s", want, v)
+		}
+	}
+	if m.rrange != rangeWeek || m.recentRunning {
+		t.Errorf("rentang %v, memindai ulang %v", m.rrange, m.recentRunning)
+	}
+	if _, ok := m.newFiles().files[`C:\unduh\lama.iso`]; !ok {
+		t.Error("penanda explorer tidak mengikuti rentang 7 hari")
+	}
+	if got := clockTime(now.Add(-3 * 24 * time.Hour)); got != "3 hari lalu" {
+		t.Errorf("clockTime 3 hari = %q", got)
+	}
+
+	// t lagi, serta 1 dan 7, memilih langsung.
+	key(m, "t")
+	if m.rrange != rangeDay {
+		t.Errorf("t kedua: rentang %v", m.rrange)
+	}
+	key(m, "7")
+	key(m, "1")
+	if m.rrange != rangeDay || len(m.recentFiles()) != 1 {
+		t.Errorf("tombol 7 lalu 1: rentang %v, %d file", m.rrange, len(m.recentFiles()))
+	}
+
+	// Hasil yang hanya memuat 24 jam (dari versi lama) tidak cukup untuk 7 hari:
+	// aplikasi memberi tahu dan memindai ulang.
+	m.recent.Since = now.Add(-rangeDay)
+	key(m, "7")
+	if !strings.Contains(m.status, "belum lengkap") {
+		t.Errorf("status = %q, want pemberitahuan data 7 hari belum lengkap", m.status)
 	}
 }

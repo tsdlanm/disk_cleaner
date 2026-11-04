@@ -29,16 +29,47 @@ type rfile struct {
 	drive int
 }
 
-// recentFiles mengembalikan file baru dalam recent.Window, per drive (urutan
-// m.recent.Drives), di dalam drive dari yang terbaru. Cache, aplikasi, dan
-// file pengguna diperlakukan sama, karena semuanya memakai ruang.
+// Rentang "File baru" yang bisa dipilih. Pemindaian selalu mengumpulkan
+// sampai rentang terlama (recent.Window); yang tampil disaring sesuai pilihan.
+const (
+	rangeDay  = 24 * time.Hour
+	rangeWeek = 7 * 24 * time.Hour
+)
+
+// rangeLabel adalah nama singkat rentang, misalnya "24 jam" atau "7 hari".
+func rangeLabel(d time.Duration) string {
+	if d >= rangeWeek {
+		return "7 hari"
+	}
+	return "24 jam"
+}
+
+// setRange memilih rentang "File baru". Rentang 7 hari butuh hasil yang
+// memuat 7 hari; hasil tersimpan dari versi lama (24 jam saja) dipindai ulang.
+func (m *model) setRange(d time.Duration) tea.Cmd {
+	if m.rrange == d {
+		return nil
+	}
+	m.rrange = d
+	m.rcursor, m.roffset, m.rshown = 0, 0, nil
+	m.recentChanged()
+	if m.recent != nil && !m.recent.Covers(d) && !m.recentRunning {
+		m.status = "Data " + rangeLabel(d) + " belum lengkap; memindai ulang…"
+		return m.startRecent()
+	}
+	return nil
+}
+
+// recentFiles mengembalikan file baru dalam rentang yang dipilih (m.rrange),
+// per drive (urutan m.recent.Drives), di dalam drive dari yang terbaru. Cache,
+// aplikasi, dan file pengguna diperlakukan sama, karena semuanya memakai ruang.
 func (m *model) recentFiles() []rfile {
 	if m.rfiles != nil {
 		return m.rfiles
 	}
 	out := []rfile{}
 	if m.recent != nil {
-		since := time.Now().Add(-recent.Window)
+		since := time.Now().Add(-m.rrange)
 		for i, d := range m.recent.Drives {
 			for _, f := range d.Files {
 				if f.Created.Before(since) {
@@ -203,9 +234,28 @@ func (m *model) restoreRecent(dir string) {
 // handleRecentKey menangani tombol saat kursor di bagian "File baru".
 // handled false berarti tombol diteruskan ke penanganan biasa.
 func (m *model) handleRecentKey(key string) (cmd tea.Cmd, handled bool) {
+	// Tombol yang tidak bergantung pada isi daftar.
+	switch key {
+	case "esc":
+		return m.setPage(pageDrives), true
+	case "r":
+		return m.startRecent(), true
+	case "t":
+		if m.rrange == rangeDay {
+			return m.setRange(rangeWeek), true
+		}
+		return m.setRange(rangeDay), true
+	case "1":
+		return m.setRange(rangeDay), true
+	case "7":
+		return m.setRange(rangeWeek), true
+	}
 	l, ok := m.recentCurrent()
 	if !ok {
-		m.focusRecent = false
+		switch key {
+		case "up", "k", "down", "j", "pgup", "pgdown", "home", "g", "end", "G", "left", "h", "enter", "right", "l", "o", "a":
+			return nil, true // daftar kosong: tidak ada yang dipilih
+		}
 		return nil, false
 	}
 	n := len(recentSelectable(m.recentLines()))
@@ -214,16 +264,8 @@ func (m *model) handleRecentKey(key string) (cmd tea.Cmd, handled bool) {
 		p = m.places()[l.place]
 	}
 	switch key {
-	case "esc":
-		m.focusRecent = false
 	case "up", "k":
-		// Dari baris pertama kembali ke drive terakhir.
-		if m.rcursor == 0 {
-			m.focusRecent = false
-			m.cursor = len(m.drives) - 1
-		} else {
-			m.rcursor--
-		}
+		m.rcursor = max(m.rcursor-1, 0)
 	case "down", "j":
 		m.rcursor = min(m.rcursor+1, n-1)
 	case "pgup":
@@ -282,8 +324,6 @@ func (m *model) handleRecentKey(key string) (cmd tea.Cmd, handled bool) {
 		if l.place >= 0 {
 			return m.analyzePath(p.dir), true
 		}
-	case "r":
-		return m.startRecent(), true
 	default:
 		return nil, false
 	}
@@ -324,37 +364,56 @@ func (m *model) recentSummary() string {
 	return s
 }
 
-// viewRecent menulis bagian "File baru" di bawah daftar drive, mengisi
-// paling banyak h baris. Mengembalikan jumlah baris yang ditulis.
-func (m *model) viewRecent(b *strings.Builder, h int) int {
-	m.line(b, titleStyle.Render("File baru")+dimStyle.Render(" · 24 jam terakhir · ")+m.recentSummary())
-	if len(m.recentFiles()) == 0 {
-		if m.recent != nil && h > 1 {
-			m.line(b, dimStyle.Render(" Tidak ada file baru dalam 24 jam terakhir."))
-			return 2
+// recentHeader adalah baris ringkasan halaman "File baru": pilihan rentang
+// (yang aktif disorot), lalu jumlah file, ukuran, dan umur data.
+func (m *model) recentHeader() string {
+	var chips []string
+	for _, d := range []time.Duration{rangeDay, rangeWeek} {
+		if d == m.rrange {
+			chips = append(chips, selStyle.Render(" "+rangeLabel(d)+" "))
+		} else {
+			chips = append(chips, dimStyle.Render(" "+rangeLabel(d)+" "))
 		}
-		return 1
+	}
+	return titleStyle.Render("File baru") + "  " + strings.Join(chips, "") + dimStyle.Render(" · ") + m.recentSummary()
+}
+
+// recentTopLine adalah baris di atas daftar: path lengkap tempat di kursor,
+// atau petunjuk untuk baris judul drive dan "tampilkan lainnya".
+func (m *model) recentTopLine() string {
+	l, ok := m.recentCurrent()
+	if !ok {
+		return ""
+	}
+	switch {
+	case l.place >= 0:
+		return " " + titleStyle.Render(truncateLeft(m.placePath(m.places()[l.place]), max(m.screenWidth()-2, 10)))
+	case l.place == placeMore:
+		return dimStyle.Render(fmt.Sprintf(" enter: tampilkan %d folder lagi", min(recentPage, m.moreLeft(l.drive))))
+	case m.rclosed[l.drive]:
+		return dimStyle.Render(" enter: buka daftar folder " + m.recent.Drives[l.drive].Root)
+	case m.visibleCount(l.drive) > recentPage:
+		return dimStyle.Render(fmt.Sprintf(" enter: kurangi jadi %d folder", (m.visibleCount(l.drive)-1)/recentPage*recentPage))
+	}
+	return dimStyle.Render(" enter: tutup daftar folder " + m.recent.Drives[l.drive].Root)
+}
+
+// viewRecentList menulis daftar "File baru" (judul drive, tempat, dan
+// "tampilkan lainnya") dalam paling banyak h baris. Mengembalikan jumlah
+// baris yang ditulis.
+func (m *model) viewRecentList(b *strings.Builder, h int) int {
+	if len(m.recentFiles()) == 0 {
+		if m.recent != nil {
+			m.line(b, dimStyle.Render(" Tidak ada file baru dalam "+rangeLabel(m.rrange)+" terakhir."))
+			return 1
+		}
+		return 0
 	}
 	lines := m.recentLines()
 	ps := m.places()
-	listH := h - 2
 	cur := -1
-	if l, ok := m.recentCurrent(); m.focusRecent && ok {
+	if l, ok := m.recentCurrent(); ok {
 		cur = slices.Index(lines, l)
-		switch {
-		case l.place >= 0:
-			m.line(b, " "+titleStyle.Render(truncateLeft(m.placePath(ps[l.place]), max(m.screenWidth()-2, 10))))
-		case l.place == placeMore:
-			m.line(b, dimStyle.Render(fmt.Sprintf(" enter: tampilkan %d folder lagi", min(recentPage, m.moreLeft(l.drive)))))
-		case m.rclosed[l.drive]:
-			m.line(b, dimStyle.Render(" enter: buka daftar folder "+m.recent.Drives[l.drive].Root))
-		case m.visibleCount(l.drive) > recentPage:
-			m.line(b, dimStyle.Render(fmt.Sprintf(" enter: kurangi jadi %d folder", (m.visibleCount(l.drive)-1)/recentPage*recentPage)))
-		default:
-			m.line(b, dimStyle.Render(" enter: tutup daftar folder "+m.recent.Drives[l.drive].Root))
-		}
-	} else {
-		m.line(b, dimStyle.Render(" ↓ dari drive terakhir untuk memilih; path lengkapnya tampil di sini"))
 	}
 	if cur >= 0 {
 		// Saat menggulir ke atas, judul drive di atas baris pertamanya ikut terlihat.
@@ -365,17 +424,17 @@ func (m *model) viewRecent(b *strings.Builder, h int) int {
 		if top < m.roffset {
 			m.roffset = top
 		}
-		if cur >= m.roffset+listH {
-			m.roffset = cur - listH + 1
+		if cur >= m.roffset+h {
+			m.roffset = cur - h + 1
 		}
 	}
-	m.roffset = min(max(m.roffset, 0), max(len(lines)-listH, 0))
+	m.roffset = min(max(m.roffset, 0), max(len(lines)-h, 0))
 
 	// Kolom nama dibatasi agar jumlah, ukuran, dan waktu tidak jauh dari namanya,
 	// dan disisakan satu kolom agar baris tidak terpotong di tepi layar.
 	nameW := min(max(m.screenWidth()-4-2-recentCountW-2-recentSizeW-2-recentTimeW-1, 10), recentNameW)
-	used := 2
-	for i := m.roffset; i < min(m.roffset+listH, len(lines)); i++ {
+	used := 0
+	for i := m.roffset; i < min(m.roffset+h, len(lines)); i++ {
 		l := lines[i]
 		switch {
 		case l.place == placeTitle:
@@ -463,12 +522,15 @@ func (m *model) renderPlace(p place, selected bool, nameW int) string {
 // clockTime menampilkan jam pasti beserta waktu relatifnya, misalnya
 // "14:05 · 2 jam lalu", agar mudah dicocokkan dengan kegiatan pengguna.
 func clockTime(t time.Time) string {
+	if time.Since(t) >= rangeDay {
+		return relTime(t) // jam pasti tidak berguna untuk kejadian berhari-hari lalu
+	}
 	return t.Format("15:04") + " · " + relTime(t)
 }
 
 // recentDriveTitle adalah judul bagian satu drive: jumlah file baru, jumlah
 // folder, dan ukurannya, dalam rentang yang sama dengan daftar di bawahnya
-// (24 jam). Pertambahan ukuran drive sejak pemindaian lama tidak ditampilkan
+// yang dipilih. Pertambahan ukuran drive sejak pemindaian lama tidak ditampilkan
 // di sini, karena rentangnya berbeda dan membingungkan.
 func (m *model) recentDriveTitle(i int, selected bool) string {
 	d := m.recent.Drives[i]

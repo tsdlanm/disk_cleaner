@@ -133,7 +133,8 @@ func (m *model) updateRecent(msg tea.Msg) tea.Cmd {
 			for p, inf := range s.Dirs {
 				m.sz.Put(p, inf)
 			}
-			if time.Since(s.Fresh()) < m.rescanAge() {
+			// Hasil dari versi lama hanya memuat 24 jam: dipindai ulang agar 7 hari lengkap.
+			if time.Since(s.Fresh()) < m.rescanAge() && s.Report.Covers(recent.Window) {
 				return nil
 			}
 		}
@@ -195,7 +196,7 @@ type newIndex struct {
 	dirs  map[string]int
 }
 
-// newFiles mengembalikan indeks file baru dalam rentang "File baru" (24 jam).
+// newFiles mengembalikan indeks file baru dalam rentang "File baru" yang dipilih (24 jam atau 7 hari).
 func (m *model) newFiles() *newIndex {
 	if m.rnew != nil {
 		return m.rnew

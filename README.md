@@ -16,26 +16,29 @@ Belum punya `scan.exe`? Build dulu dengan `go build -o scan.exe .`
 
 ## Halaman utama
 
-Halaman utama punya dua halaman: **Drive** (dengan **File baru** di bawahnya) dan **Recycle Bin**. Tekan `Tab` untuk
-pindah halaman.
+Halaman utama punya tiga halaman: **Drive**, **File baru**, dan **Recycle Bin**. Tekan `Tab` untuk pindah halaman
+(`Shift+Tab` mundur).
 
 - **Drive**: pemakaian dan ruang bebas tiap drive. `Enter` membuka drive.
-- **File baru** (di bawah daftar drive; `↓` dari drive terakhir masuk ke sini, `Esc` kembali ke drive): folder yang
-  kemasukan file baru dalam **24 jam terakhir**, per drive, dari yang terbaru. File dikelompokkan ke folder yang
+- **File baru** (halaman sendiri, di antara Drive dan Recycle Bin; `Esc` kembali ke Drive): folder yang kemasukan
+  file baru, per drive, dari yang terbaru. **Rentangnya bisa dipilih: 24 jam (bawaan) atau 7 hari**: `t` berganti,
+  atau `1` untuk 24 jam dan `7` untuk 7 hari. Pemindaian selalu mengumpulkan 7 hari, jadi berganti rentang
+  langsung tanpa memindai ulang (hasil tersimpan dari versi lama yang hanya memuat 24 jam dipindai ulang sekali).
+  Rentang yang dipilih juga dipakai untuk penanda hijau `● baru` di explorer, dan kembali ke 24 jam saat
+  aplikasi dibuka lagi. File dikelompokkan ke folder yang
   bermakna (`~\AppData\Local\Google\Chrome`, `C:\Program Files (x86)\Microsoft\Copilot`, `D:\anam\scan_cli`), dan
   cache, aplikasi, maupun file milikmu tidak dibedakan, karena semuanya memakai ruang. `~` adalah folder profilmu.
   Daftar ini **diperbarui langsung** selama aplikasi terbuka (tanda `● langsung`).
 
   ```
-  File baru · 24 jam terakhir · 913 file · 4.9 GB · dari yang terbaru · dipindai 1 jam lalu
-   C:\ OS · 902 file baru di 16 tempat · 4.1 GB · ukuran drive +601.6 MB sejak 25 Oct
+  Drive  │  File baru  │  Recycle Bin    tab pindah halaman
+  File baru   24 jam  7 hari  · 913 file · 4.9 GB · dari yang terbaru · dipindai 1 jam lalu
    C:\Program Files (x86)\Microsoft\Edge\      ← path lengkap baris di kursor
-   C:\ OS · 902 file baru di 16 tempat · 4.1 GB · ukuran drive +601.6 MB sejak 25 Oct
+   ▾ C:\ OS · 902 file baru · 16 folder · 4.1 GB
       go-build\                     53 file   126.8 MB  1 menit lalu
       Edge\                        197 file   842.2 MB  1 jam lalu
       scan-windows-amd64 (1).zip              3.3 MB  21 jam lalu
   ```
-
   - Tiap baris: nama folder terluarnya (biru), atau nama file jika isinya hanya satu file; lalu jumlah file baru,
     ukurannya, dan kapan file terbarunya dibuat. **Path lengkapnya tampil di baris paling atas bagian ini saat kursor
     di baris itu**, jadi folder bernama sama (misalnya dua `Edge`) tetap bisa dibedakan.
@@ -63,17 +66,19 @@ pindah halaman.
 | `Enter` | Buka drive / folder |
 | `←` / `Backspace` | Kembali ke folder sebelumnya |
 | `Esc` | Kembali ke halaman utama |
-| `Tab` | Di halaman utama: pindah halaman Drive ↔ Recycle Bin |
+| `Tab` / `Shift+Tab` | Di halaman utama: pindah halaman Drive → File baru → Recycle Bin |
 | `Space` | Tandai item (bisa banyak) |
 | `d` / `Delete` | Hapus item ke Recycle Bin (ada konfirmasi) |
 | `r` | Hitung ulang (di halaman utama: pindai ulang semua drive) |
+| `t` / `1` / `7` | Di File baru: ganti rentang 24 jam ↔ 7 hari, atau pilih langsung |
 | `o` | Buka di Windows Explorer |
 | `a` | Pindai folder yang dipilih lalu tanya dulu sebelum dikirim ke AI (analisis + chat) |
 | `p` | Pengaturan AI |
 | `A` | Restart sebagai Administrator (agar folder terkunci ikut terhitung) |
 | `q` | Keluar |
 
-Di dalam folder, file yang dibuat dalam 24 jam terakhir ditandai hijau **`● baru · 14:05 · 2 jam lalu`**, dan subfolder
+Di dalam folder, file yang dibuat dalam rentang File baru (24 jam atau 7 hari) ditandai hijau **`● baru · 14:05 · 2 jam lalu`**
+(untuk yang lebih dari sehari cukup `● baru · 3 hari lalu`), dan subfolder
 yang berisi file baru diberi label **`N file baru`**.
 
 ## Analisis AI dan chat

@@ -16,8 +16,11 @@ import (
 	"github.com/tsdlanm/cli_app/internal/sizer"
 )
 
-// Window adalah rentang "baru": file yang dibuat dalam 24 jam terakhir.
-const Window = 24 * time.Hour
+// Window adalah rentang terlama yang dikumpulkan pemindaian: file yang dibuat
+// dalam 7 hari terakhir. Rentang yang tampil (24 jam atau 7 hari) dipilih
+// pengguna dan menyaring hasil ini, jadi berganti rentang tidak perlu
+// memindai ulang.
+const Window = 7 * 24 * time.Hour
 
 // Options mengatur pemindaian.
 type Options struct {
@@ -149,6 +152,13 @@ type scan struct {
 	small  int64
 	smallN int64
 	denied int64
+}
+
+// Covers melaporkan apakah hasil memuat semua file baru dalam rentang d
+// terakhir. Hasil tersimpan dari versi yang hanya mengumpulkan 24 jam tidak
+// memuat 7 hari, jadi perlu dipindai ulang sebelum rentang itu bisa dipilih.
+func (r *Report) Covers(d time.Duration) bool {
+	return !r.Since.After(time.Now().Add(-d))
 }
 
 // Scan memindai roots dan mendaftar file yang dibuat dalam Window terakhir.

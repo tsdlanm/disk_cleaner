@@ -177,3 +177,15 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		t.Error("snapshot yang tidak ada seharusnya error")
 	}
 }
+
+func TestReportCovers(t *testing.T) {
+	now := time.Now()
+	week := &Report{Since: now.Add(-Window)}
+	day := &Report{Since: now.Add(-24 * time.Hour)} // hasil dari versi yang hanya mengumpulkan 24 jam
+	if !week.Covers(7*24*time.Hour) || !week.Covers(24*time.Hour) {
+		t.Error("hasil 7 hari harus memuat kedua rentang")
+	}
+	if day.Covers(7*24*time.Hour) || !day.Covers(24*time.Hour) {
+		t.Error("hasil 24 jam hanya memuat 24 jam")
+	}
+}
