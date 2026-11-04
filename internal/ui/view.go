@@ -34,8 +34,9 @@ var (
 )
 
 const (
-	keysDrives = "↑↓ pilih · enter buka · tab File baru · a analisis · r pindai · q keluar"
-	keysRecent = "↑↓ pilih · enter masuk · ← tutup · t rentang · a analisis · o Explorer · r pindai · q keluar"
+	keysDrives = "↑↓ pilih · enter buka · tab File baru · t tren · a analisis · r pindai · q keluar"
+	keysRecent = "↑↓ pilih · enter masuk · ← tutup · t rentang · s urutan · a analisis · o Explorer · r pindai · q keluar"
+	keysTrend  = "↑↓ pilih · enter masuk · a analisis · o Explorer · t rentang · esc ke drive · q keluar"
 	keysBin    = "↑↓ pilih · space tandai · u pulihkan · d hapus · E kosongkan · esc kembali · q keluar"
 	keysDir    = "↑↓ pilih · enter buka · ← naik · space tandai · d hapus · a analisis · o Explorer · q keluar"
 )
@@ -101,12 +102,16 @@ func (m *model) viewHome(b *strings.Builder) {
 		m.line(b, dimStyle.Render(fmt.Sprintf("%d drive · %s", len(m.drives), mode)))
 		b.WriteString("\n")
 		used = m.viewDrives(b, h)
+		used += m.viewTrend(b, h-used)
 	}
 	for range h - used {
 		b.WriteString("\n")
 	}
 	if m.page == pageDrives {
 		keys = m.footerKeys(keys)
+		if m.trendFocus {
+			keys = keysTrend
+		}
 	}
 	m.footer(b, keys)
 }
@@ -139,7 +144,7 @@ func (m *model) viewDrives(b *strings.Builder, h int) int {
 		used++
 		d := m.drives[i]
 		name := d.Root + "  " + runewidth.FillRight(runewidth.Truncate(d.Label, 16, "…"), 16)
-		if i == m.cursor {
+		if i == m.cursor && !m.trendFocus {
 			name = selStyle.Render(name)
 		} else {
 			name = dirStyle.Render(name)

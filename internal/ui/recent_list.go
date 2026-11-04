@@ -32,16 +32,31 @@ type rfile struct {
 // Rentang "File baru" yang bisa dipilih. Pemindaian selalu mengumpulkan
 // sampai rentang terlama (recent.Window); yang tampil disaring sesuai pilihan.
 const (
-	rangeDay  = 24 * time.Hour
-	rangeWeek = 7 * 24 * time.Hour
+	rangeDay   = 24 * time.Hour
+	rangeWeek  = 7 * 24 * time.Hour
+	rangeMonth = 30 * 24 * time.Hour
 )
 
-// rangeLabel adalah nama singkat rentang, misalnya "24 jam" atau "7 hari".
+// rangeLabel adalah nama singkat rentang, misalnya "24 jam", "7 hari", atau "30 hari".
 func rangeLabel(d time.Duration) string {
+	if d >= rangeMonth {
+		return "30 hari"
+	}
 	if d >= rangeWeek {
 		return "7 hari"
 	}
 	return "24 jam"
+}
+
+// nextRange adalah rentang berikutnya dalam urutan 24 jam, 7 hari, 30 hari.
+func nextRange(d time.Duration) time.Duration {
+	switch {
+	case d < rangeWeek:
+		return rangeWeek
+	case d < rangeMonth:
+		return rangeMonth
+	}
+	return rangeDay
 }
 
 // setRange memilih rentang "File baru". Rentang 7 hari butuh hasil yang
@@ -51,6 +66,7 @@ func (m *model) setRange(d time.Duration) tea.Cmd {
 		return nil
 	}
 	m.rrange = d
+	m.rbysize = d >= rangeWeek // bawaan: 24 jam terbaru, 7 dan 30 hari terbesar
 	m.rcursor, m.roffset, m.rshown = 0, 0, nil
 	m.recentChanged()
 	if m.recent != nil && !m.recent.Covers(d) && !m.recentRunning {
@@ -241,14 +257,18 @@ func (m *model) handleRecentKey(key string) (cmd tea.Cmd, handled bool) {
 	case "r":
 		return m.startRecent(), true
 	case "t":
-		if m.rrange == rangeDay {
-			return m.setRange(rangeWeek), true
-		}
-		return m.setRange(rangeDay), true
+		return m.setRange(nextRange(m.rrange)), true
+	case "s":
+		m.rbysize = !m.rbysize
+		m.rcursor, m.roffset, m.rshown = 0, 0, nil
+		m.recentChanged()
+		return nil, true
 	case "1":
 		return m.setRange(rangeDay), true
 	case "7":
 		return m.setRange(rangeWeek), true
+	case "3":
+		return m.setRange(rangeMonth), true
 	}
 	l, ok := m.recentCurrent()
 	if !ok {
@@ -345,8 +365,12 @@ func (m *model) recentSummary() string {
 	for _, f := range files {
 		size += f.Size
 	}
-	s := dimStyle.Render(fmt.Sprintf("%s file · %s · dari yang terbaru",
-		format.Int(int64(len(files))), format.Bytes(size)))
+	order := "dari yang terbaru"
+	if m.rbysize {
+		order = "dari yang terbesar"
+	}
+	s := dimStyle.Render(fmt.Sprintf("%s file · %s · %s",
+		format.Int(int64(len(files))), format.Bytes(size), order))
 	// Data yang tampil bisa berasal dari hasil tersimpan; tunjukkan umurnya,
 	// dan apakah perubahan sejak itu terus diikuti.
 	switch {
@@ -368,7 +392,7 @@ func (m *model) recentSummary() string {
 // (yang aktif disorot), lalu jumlah file, ukuran, dan umur data.
 func (m *model) recentHeader() string {
 	var chips []string
-	for _, d := range []time.Duration{rangeDay, rangeWeek} {
+	for _, d := range []time.Duration{rangeDay, rangeWeek, rangeMonth} {
 		if d == m.rrange {
 			chips = append(chips, selStyle.Render(" "+rangeLabel(d)+" "))
 		} else {

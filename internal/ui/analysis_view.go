@@ -828,4 +828,3 @@ func (m *model) dataLines(an *analysis) []string {
 	}
 	return out
 }
-

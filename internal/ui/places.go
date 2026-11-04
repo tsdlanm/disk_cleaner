@@ -186,6 +186,9 @@ func (m *model) places() []place {
 		if a.drive != b.drive {
 			return cmp.Compare(a.drive, b.drive)
 		}
+		if m.rbysize && a.size != b.size {
+			return cmp.Compare(b.size, a.size)
+		}
 		return b.newest.Compare(a.newest)
 	})
 	m.rplaces = out

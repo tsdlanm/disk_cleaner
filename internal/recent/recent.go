@@ -20,7 +20,7 @@ import (
 // dalam 7 hari terakhir. Rentang yang tampil (24 jam atau 7 hari) dipilih
 // pengguna dan menyaring hasil ini, jadi berganti rentang tidak perlu
 // memindai ulang.
-const Window = 7 * 24 * time.Hour
+const Window = 30 * 24 * time.Hour
 
 // Options mengatur pemindaian.
 type Options struct {

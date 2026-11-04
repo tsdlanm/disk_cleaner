@@ -3,6 +3,7 @@ package ui
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/tsdlanm/cli_app/internal/drives"
 	"github.com/tsdlanm/cli_app/internal/recent"
 	"github.com/tsdlanm/cli_app/internal/sizer"
+	"github.com/tsdlanm/cli_app/internal/trend"
 )
 
 // tempDir membuat folder uji berejaan panjang, seperti drive yang dipindai
@@ -232,5 +234,81 @@ func TestNewMarkers(t *testing.T) {
 		if strings.Contains(l, "lama.txt") && strings.Contains(l, "baru") {
 			t.Errorf("file lama ikut ditandai baru: %q", l)
 		}
+	}
+}
+
+func TestTrendSection(t *testing.T) {
+	m := newModel(sizer.New())
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m.Update(drivesMsg{{Root: `C:\`, Ready: true, Total: 100 << 30, Free: 50 << 30}})
+	if v := m.View(); !strings.Contains(v, "Belum ada riwayat") {
+		t.Errorf("tanpa riwayat:\n%s", v)
+	}
+
+	now := time.Now()
+	const gb = 1 << 30
+	h := &trend.History{}
+	h.Add(now.Add(-8*24*time.Hour), map[string]int64{`C:\proj\cache`: 1 * gb, `C:\proj`: 2 * gb})
+	h.Add(now.Add(-3*time.Hour), map[string]int64{`C:\proj\cache`: 4 * gb, `C:\proj`: 5 * gb})
+	m.Update(snapshotMsg{hist: h})
+	v := m.View() // bawaan 7 hari
+	for _, want := range []string{"Tren", "7 hari", "+3.0 GB", `C:\proj\cache`} {
+		if !strings.Contains(v, want) {
+			t.Errorf("7 hari: View tidak memuat %q:\n%s", want, v)
+		}
+	}
+	key(m, "1") // 24 jam: riwayat 3 jam belum cukup
+	if v := m.View(); !strings.Contains(v, "Belum cukup riwayat untuk 24 jam") {
+		t.Errorf("24 jam:\n%s", v)
+	}
+	key(m, "3")
+	if m.trange != rangeMonth {
+		t.Errorf("3: rentang %v", m.trange)
+	}
+}
+
+func TestTrendSelect(t *testing.T) {
+	root := tempDir(t)
+	cache := filepath.Join(root, "cache")
+	write(t, filepath.Join(cache, "x.bin"), 10)
+	m := newModel(sizer.New())
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m.Update(drivesMsg{{Root: `C:\`, Ready: true}, {Root: `D:\`, Ready: true}})
+	const gb = 1 << 30
+	h := &trend.History{}
+	now := time.Now()
+	h.Add(now.Add(-8*24*time.Hour), map[string]int64{cache: 1 * gb, `C:\gone`: 1 * gb})
+	h.Add(now.Add(-time.Hour), map[string]int64{cache: 4 * gb, `C:\gone`: 3 * gb})
+	m.Update(snapshotMsg{hist: h})
+	m.View() // menggambar: jumlah baris Tren diketahui
+
+	key(m, "down") // drive kedua
+	key(m, "down") // masuk ke daftar Tren
+	if !m.trendFocus || m.tcursor != 0 {
+		t.Fatalf("↓ dari drive terakhir: fokus %v, kursor %d", m.trendFocus, m.tcursor)
+	}
+	if v := m.View(); !strings.Contains(v, "enter masuk · a analisis") {
+		t.Errorf("petunjuk tombol Tren tidak tampil:\n%s", v)
+	}
+	key(m, "down")
+	if m.tcursor != 1 {
+		t.Errorf("↓ di Tren: kursor %d", m.tcursor)
+	}
+	key(m, "up")
+	g, _ := m.trendSelected() // baris pertama: pertambahan terbesar (cache atau gone, sama-sama +2 GB)
+	if g.Delta < 2*gb-trend.MinDir {
+		t.Errorf("baris terpilih: %+v", g)
+	}
+	// Folder yang masih ada dibuka; yang sudah hilang memberi tahu.
+	m.tcursor = slices.IndexFunc(m.trendRows, func(g trend.Growth) bool { return g.Path == `C:\gone` })
+	key(m, "enter")
+	if m.path != "" || !strings.Contains(m.status, "sudah tidak ada") {
+		t.Errorf("folder hilang: path %q status %q", m.path, m.status)
+	}
+	m.tcursor = slices.IndexFunc(m.trendRows, func(g trend.Growth) bool { return g.Path == cache })
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	run(m, cmd)
+	if m.path != cache {
+		t.Errorf("enter: path %q, want %q", m.path, cache)
 	}
 }

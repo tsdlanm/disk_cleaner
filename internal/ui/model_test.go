@@ -936,11 +936,27 @@ func TestRecent(t *testing.T) {
 		t.Errorf("sisa C setelah enter:\n%s", v)
 	}
 
-	// Urutannya selalu dari yang terbaru; tidak ada tombol untuk mengubahnya.
+	// Bawaan 24 jam: terbaru. s mengganti ke terbesar (kursor kembali ke atas), s lagi kembali.
 	key(m, "up")
+	if ps := m.places(); ps[0].dir != `C:\proj00` || m.rbysize {
+		t.Errorf("urutan bawaan: pertama %s, rbysize %v", ps[0].dir, m.rbysize)
+	}
 	key(m, "s")
-	if ps := m.places(); ps[0].dir != `C:\proj00` || m.selectedRecent() != `C:\proj09` {
-		t.Errorf("urutan berubah: pertama %s, kursor %s", ps[0].dir, m.selectedRecent())
+	if !m.rbysize || m.rcursor != 0 {
+		t.Errorf("s: rbysize %v, rcursor %d", m.rbysize, m.rcursor)
+	}
+	for i, p := range m.places()[1:] {
+		if p.drive == m.places()[i].drive && p.size > m.places()[i].size {
+			t.Errorf("tidak urut terbesar: %d", i)
+		}
+	}
+	key(m, "7")
+	if !m.rbysize {
+		t.Error("7 hari: bawaan harus terbesar")
+	}
+	key(m, "1")
+	if m.rbysize {
+		t.Error("24 jam: bawaan harus terbaru")
 	}
 
 	// esc kembali ke halaman Drive.
@@ -1506,6 +1522,7 @@ func TestAnalysisTabKeepsTop(t *testing.T) {
 	key(m, "g")
 	top("setelah g")
 }
+
 // Hasil analisis tampil seperti daftar explorer: judul kelompok berwarna
 // dengan jumlah item, folder induk yang sama ditulis sekali, akhiran platform
 // disembunyikan, ukuran rata kanan, dan penjelasan yang sama ditulis sekali.
@@ -1559,6 +1576,7 @@ func TestResultLayout(t *testing.T) {
 		t.Errorf("ukuran tidak sejajar: %v\n%s", ends, out)
 	}
 }
+
 // Header hasil: ukuran folder, bar bagian aman/cek/simpan, dan persen di
 // legenda, judul kelompok, dan tiap item.
 func TestResultPercent(t *testing.T) {
@@ -1599,6 +1617,7 @@ func TestResultPercent(t *testing.T) {
 		}
 	}
 }
+
 // "File baru" punya halaman sendiri dan rentang yang bisa dipilih: 24 jam
 // (bawaan) atau 7 hari. Berganti rentang hanya menyaring, tanpa memindai ulang.
 func TestRecentRange(t *testing.T) {
@@ -1653,10 +1672,18 @@ func TestRecentRange(t *testing.T) {
 		t.Errorf("clockTime 3 hari = %q", got)
 	}
 
-	// t lagi, serta 1 dan 7, memilih langsung.
+	// t lagi ke 30 hari, lalu kembali ke 24 jam; 1, 7, dan 3 memilih langsung.
+	key(m, "t")
+	if m.rrange != rangeMonth || !m.rbysize {
+		t.Errorf("t kedua: rentang %v, terbesar %v", m.rrange, m.rbysize)
+	}
 	key(m, "t")
 	if m.rrange != rangeDay {
-		t.Errorf("t kedua: rentang %v", m.rrange)
+		t.Errorf("t ketiga: rentang %v", m.rrange)
+	}
+	key(m, "3")
+	if m.rrange != rangeMonth {
+		t.Errorf("3: rentang %v", m.rrange)
 	}
 	key(m, "7")
 	key(m, "1")

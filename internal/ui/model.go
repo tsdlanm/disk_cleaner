@@ -25,6 +25,7 @@ import (
 	"github.com/tsdlanm/cli_app/internal/recent"
 	"github.com/tsdlanm/cli_app/internal/sizer"
 	"github.com/tsdlanm/cli_app/internal/trash"
+	"github.com/tsdlanm/cli_app/internal/trend"
 	"github.com/tsdlanm/cli_app/internal/watch"
 )
 
@@ -101,6 +102,16 @@ type model struct {
 	page        int           // halaman utama yang tampil: pageDrives, pageRecent, pageBin
 	focusRecent bool          // halaman "File baru" yang tampil (kursor ada di daftarnya)
 	rrange      time.Duration // rentang "File baru" yang dipilih: 24 jam (bawaan) atau 7 hari
+	trange      time.Duration // rentang Tren di halaman Drive: 24 jam, 7 hari, atau 30 hari
+	trendHist   *trend.History
+	trendRows   []trend.Growth // hasil perbandingan; dihitung ulang jika trendDone false
+	trendBase   time.Time
+	trendOK     bool
+	trendDone   bool
+	trendFocus  bool // kursor di daftar Tren, bukan di daftar drive
+	tcursor     int  // baris Tren yang dipilih
+	trendShown  int  // jumlah baris Tren yang tampil (diisi saat menggambar)
+	rbysize     bool // urutan "File baru": true = terbesar, false = terbaru
 	rcursor     int
 	roffset     int
 	rfiles      []rfile               // file di halaman "File baru"; nil = susun ulang
@@ -186,7 +197,7 @@ func Run(opts Options) (Result, error) {
 func newModel(sz *sizer.Sizer) *model {
 	return &model{
 		sz: sz, remember: make(map[string]string), marks: make(map[string]bool), trash: trash.Move,
-		cfg: analyze.DefaultConfig, newProvider: analyze.Config.NewProvider, rrange: rangeDay,
+		cfg: analyze.DefaultConfig, newProvider: analyze.Config.NewProvider, rrange: rangeDay, trange: rangeWeek,
 		dirExists: func(p string) bool { _, err := os.Stat(p); return !os.IsNotExist(err) },
 		bmarks:    make(map[string]bool), binList: bin.List, binRestore: bin.Restore, binPurge: bin.Purge, binEmpty: bin.Empty,
 	}
@@ -413,6 +424,8 @@ func (m *model) handleKey(key string) tea.Cmd {
 			cmd, handled = m.handleBinKey(key)
 		case m.focusRecent:
 			cmd, handled = m.handleRecentKey(key)
+		case m.page == pageDrives:
+			cmd, handled = m.handleTrendKey(key)
 		}
 		if handled {
 			return cmd

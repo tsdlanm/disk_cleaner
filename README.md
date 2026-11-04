@@ -19,11 +19,20 @@ Belum punya `scan.exe`? Build dulu dengan `go build -o scan.exe .`
 Halaman utama punya tiga halaman: **Drive**, **File baru**, dan **Recycle Bin**. Tekan `Tab` untuk pindah halaman
 (`Shift+Tab` mundur).
 
-- **Drive**: pemakaian dan ruang bebas tiap drive. `Enter` membuka drive.
+- **Drive**: pemakaian dan ruang bebas tiap drive. `Enter` membuka drive. Di bawah daftar drive ada bagian
+  **Tren**: folder yang paling **bertambah ukurannya** dibanding 24 jam, 7 hari (bawaan), atau 30 hari lalu
+  (`t` berganti, atau `1` / `7` / `3`). Ini menangkap file yang membesar (log, database, cache), bukan hanya file
+  baru. Setiap pemindaian mencatat ukuran sekitar 600 folder terbesar (≥ 50 MB) ke `%LOCALAPPDATA%\scan\trend.gob`
+  (beberapa MB paling banyak, riwayat disimpan 40 hari); daftar file tidak disimpan. Tren baru muncul setelah ada
+  titik riwayat yang cukup lama (titik pembanding harus berumur setengah sampai dua kali rentang), jadi di hari
+  pertama masih kosong. Folder induk yang pertambahannya hampir semua dari satu subfolder tidak ditulis ganda.
+  `↓` dari drive terakhir masuk ke daftar Tren: `Enter` membuka folder itu, `a` menganalisis dengan AI,
+  `o` membukanya di Explorer, `Esc` kembali ke daftar drive.
 - **File baru** (halaman sendiri, di antara Drive dan Recycle Bin; `Esc` kembali ke Drive): folder yang kemasukan
-  file baru, per drive, dari yang terbaru. **Rentangnya bisa dipilih: 24 jam (bawaan) atau 7 hari**: `t` berganti,
-  atau `1` untuk 24 jam dan `7` untuk 7 hari. Pemindaian selalu mengumpulkan 7 hari, jadi berganti rentang
-  langsung tanpa memindai ulang (hasil tersimpan dari versi lama yang hanya memuat 24 jam dipindai ulang sekali).
+  file baru, per drive, dari yang terbaru. **Rentangnya bisa dipilih: 24 jam (bawaan), 7 hari, atau 30 hari**: `t` berganti,
+  atau `1`, `7`, `3` memilih langsung. **Urutan**: `s` berganti terbaru ↔ terbesar (bawaan: terbaru untuk 24 jam,
+  terbesar untuk 7 dan 30 hari). Pemindaian selalu mengumpulkan 30 hari, jadi berganti rentang
+  langsung tanpa memindai ulang (hasil tersimpan dari versi lama yang belum memuat 30 hari dipindai ulang sekali).
   Rentang yang dipilih juga dipakai untuk penanda hijau `● baru` di explorer, dan kembali ke 24 jam saat
   aplikasi dibuka lagi. File dikelompokkan ke folder yang
   bermakna (`~\AppData\Local\Google\Chrome`, `C:\Program Files (x86)\Microsoft\Copilot`, `D:\anam\scan_cli`), dan
@@ -70,14 +79,15 @@ Halaman utama punya tiga halaman: **Drive**, **File baru**, dan **Recycle Bin**.
 | `Space` | Tandai item (bisa banyak) |
 | `d` / `Delete` | Hapus item ke Recycle Bin (ada konfirmasi) |
 | `r` | Hitung ulang (di halaman utama: pindai ulang semua drive) |
-| `t` / `1` / `7` | Di File baru: ganti rentang 24 jam ↔ 7 hari, atau pilih langsung |
+| `t` / `1` / `7` / `3` | Di File baru dan Tren (halaman Drive): ganti rentang 24 jam → 7 hari → 30 hari, atau pilih langsung |
+| `s` | Di File baru: urutan terbaru ↔ terbesar (bawaan: terbaru untuk 24 jam, terbesar untuk 7 hari) |
 | `o` | Buka di Windows Explorer |
 | `a` | Pindai folder yang dipilih lalu tanya dulu sebelum dikirim ke AI (analisis + chat) |
 | `p` | Pengaturan AI |
 | `A` | Restart sebagai Administrator (agar folder terkunci ikut terhitung) |
 | `q` | Keluar |
 
-Di dalam folder, file yang dibuat dalam rentang File baru (24 jam atau 7 hari) ditandai hijau **`● baru · 14:05 · 2 jam lalu`**
+Di dalam folder, file yang dibuat dalam rentang File baru (24 jam, 7, atau 30 hari) ditandai hijau **`● baru · 14:05 · 2 jam lalu`**
 (untuk yang lebih dari sehari cukup `● baru · 3 hari lalu`), dan subfolder
 yang berisi file baru diberi label **`N file baru`**.
 

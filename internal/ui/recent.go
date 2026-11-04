@@ -14,6 +14,7 @@ import (
 
 	"github.com/tsdlanm/cli_app/internal/recent"
 	"github.com/tsdlanm/cli_app/internal/sizer"
+	"github.com/tsdlanm/cli_app/internal/trend"
 )
 
 type (
@@ -23,7 +24,10 @@ type (
 		at   time.Time // waktu pemindaian
 		err  error
 	}
-	snapshotMsg   struct{ snap *recent.Snapshot } // nil jika belum ada atau rusak
+	snapshotMsg struct {
+		snap *recent.Snapshot // nil jika belum ada atau rusak
+		hist *trend.History   // riwayat tren; nil di tes
+	}
 	recentTickMsg struct{}
 )
 
@@ -42,9 +46,10 @@ func loadSnapshot() tea.Msg {
 	if base == "" {
 		return snapshotMsg{}
 	}
+	hist := trend.Load(trend.Path(base))
 	snap, err := recent.LoadSnapshot(recent.SnapshotPath(base))
 	if err != nil {
-		return snapshotMsg{}
+		return snapshotMsg{hist: hist}
 	}
 	if snap.Report != nil {
 		// Hasil tersimpan bisa memuat path berejaan pendek, dan file yang sudah
@@ -52,7 +57,7 @@ func loadSnapshot() tea.Msg {
 		snap.Report.Normalize()
 		snap.Report.PruneMissing()
 	}
-	return snapshotMsg{snap: snap}
+	return snapshotMsg{snap: snap, hist: hist}
 }
 
 // rescanAge adalah umur hasil tersimpan yang masih dipakai tanpa memindai ulang.
@@ -125,11 +130,17 @@ func recentTick() tea.Cmd {
 func (m *model) updateRecent(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case snapshotMsg:
+		if msg.hist != nil {
+			m.trendHist, m.trendDone = msg.hist, false
+		}
 		// Hasil tersimpan langsung ditampilkan; pemindaian penuh hanya jika
 		// belum ada hasil atau hasilnya sudah terlalu lama.
 		if s := msg.snap; s != nil && s.Report != nil {
 			m.setRecent(s.Report, s.Time)
 			m.snapDirs, m.dataFresh = s.Dirs, s.Fresh()
+			if msg.hist != nil {
+				m.seedTrend(s)
+			}
 			for p, inf := range s.Dirs {
 				m.sz.Put(p, inf)
 			}
@@ -153,6 +164,7 @@ func (m *model) updateRecent(msg tea.Msg) tea.Cmd {
 			m.liveDirty = true
 		}
 		m.liveBuf, m.liveLost = nil, false
+		return m.recordTrend(msg.at, msg.dirs)
 	case recentTickMsg:
 		if m.recentRunning {
 			return recentTick()
